@@ -29,7 +29,7 @@ if torch.cuda.is_available():
 # Normally, We don't need augmentations in testing and validation.
 # All we need here is to resize the PIL image and transform it into Tensor.
 test_tfm = transforms.Compose([
-    transforms.Resize((256, 256)),  # Resize the image into a fixed shape (height = width = 512)
+    transforms.Resize((128, 128)),  # Resize the image into a fixed shape (height = width = 512)
     transforms.ToTensor(),
 ])
 
@@ -39,7 +39,7 @@ train_tfm = transforms.Compose([
     # Resize the image into a fixed shape (height = width = 128)
     # You may add some transforms here.
     # ToTensor() should be the last one of the transforms.
-    transforms.Resize((256, 256)),
+    transforms.Resize((128, 128)),
     transforms.ToTensor(),
 ])
 
@@ -74,48 +74,39 @@ class FoodDataset(Dataset):
 class Classifier(nn.Module):
     def __init__(self):
         super(Classifier, self).__init__()
-        # input dimension [3, 256, 256]
+        # input dimension [3, 128, 128]
         self.cnn = nn.Sequential(
             # First block
-            nn.Conv2d(3, 64, 3, 1, 1),      # [64, 256, 256]
+            nn.Conv2d(3, 64, 3, 1, 1),      # [64, 128, 128]
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [64, 128, 128]
+            nn.MaxPool2d(2, 2, 0),          # [64, 64, 64]
             
             # Second block
-            nn.Conv2d(64, 128, 3, 1, 1),    # [128, 128, 128]
+            nn.Conv2d(64, 128, 3, 1, 1),    # [128, 64, 64]
             nn.BatchNorm2d(128),
             nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [128, 64, 64]
+            nn.MaxPool2d(2, 2, 0),          # [128, 32, 32]
             
             # Third block
-            nn.Conv2d(128, 256, 3, 1, 1),   # [256, 64, 64]
+            nn.Conv2d(128, 256, 3, 1, 1),   # [256, 32, 32]
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.Conv2d(256, 256, 3, 1, 1),   # [256, 64, 64]
+            nn.Conv2d(256, 256, 3, 1, 1),   # [256, 32, 32]
             nn.BatchNorm2d(256),
             nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [256, 32, 32]
+            nn.MaxPool2d(2, 2, 0),          # [256, 16, 16]
             
             # Fourth block
-            nn.Conv2d(256, 512, 3, 1, 1),   # [512, 32, 32]
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, 3, 1, 1),   # [512, 32, 32]
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [512, 16, 16]
-            
-            # Fifth block
-            nn.Conv2d(512, 512, 3, 1, 1),   # [512, 16, 16]
+            nn.Conv2d(256, 512, 3, 1, 1),   # [512, 16, 16]
             nn.BatchNorm2d(512),
             nn.ReLU(),
             nn.Conv2d(512, 512, 3, 1, 1),   # [512, 16, 16]
             nn.BatchNorm2d(512),
             nn.ReLU(),
             nn.MaxPool2d(2, 2, 0),          # [512, 8, 8]
-
-            # Sixth block
+            
+            # Fifth block
             nn.Conv2d(512, 512, 3, 1, 1),   # [512, 8, 8]
             nn.BatchNorm2d(512),
             nn.ReLU(),
@@ -123,13 +114,11 @@ class Classifier(nn.Module):
         )
         
         self.fc = nn.Sequential(
-            nn.Dropout(0.5),  # 과적합 방지
-            nn.Linear(512 * 4 * 4, 2048),
+            nn.Linear(512 * 4 * 4, 1024),
             nn.ReLU(),
-            nn.Dropout(0.5),  # 과적합 방지
-            nn.Linear(2048, 1024),
+            nn.Linear(1024, 512),
             nn.ReLU(),
-            nn.Linear(1024, 11)
+            nn.Linear(512, 11)
         )
 
     def forward(self, x):
@@ -138,7 +127,7 @@ class Classifier(nn.Module):
         return self.fc(out)
 
 batch_size = 64
-_dataset_dir = "./data"
+_dataset_dir = "/content/data/"
 # Construct datasets.
 # The argument "loader" tells how torchvision reads the data.
 train_set = FoodDataset(os.path.join(_dataset_dir,"train"), tfm=train_tfm)
@@ -151,7 +140,7 @@ valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_wo
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 # The number of training epochs and patience.
-n_epochs = 3
+n_epochs = 30
 patience = 300  # If no improvement in 'patience' epochs, early stop
 
 # Initialize a model, and put it on the device specified.
@@ -160,8 +149,13 @@ model = Classifier().to(device)
 # For the classification task, we use cross-entropy as the measurement of performance.
 criterion = nn.CrossEntropyLoss()
 
-# Initialize optimizer, you may fine-tune some hyperparameters such as learning rate on your own.
-optimizer = torch.optim.AdamW(model.parameters(), lr=0.001)
+# Initialize optimizer and scheduler
+optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=5,    # 전체 에폭 수
+    eta_min=1e-6       # 최소 학습률
+)
 
 # Initialize wandb before training
 wandb.init(
@@ -171,8 +165,11 @@ wandb.init(
         "dataset": "Food-11",
         "epochs": n_epochs,
         "batch_size": batch_size,
-        "learning_rate": 0.001,
-        "optimizer": "AdamW"
+        "learning_rate": 0.01,
+        "scheduler": "CosineAnnealingLR",  # 스케줄러 이름 변경
+        "T_max": 5,
+        "optimizer": "Adam",
+        "min_lr": 1e-6
     }
 )
 
@@ -184,6 +181,9 @@ stale = 0
 best_acc = 0
 _exp_name = "food_classification_experiment_Simple"
 
+# Initialize step counter
+global_step = 0
+
 for epoch in range(n_epochs):
 
     # ---------- Training ----------
@@ -194,7 +194,7 @@ for epoch in range(n_epochs):
     train_loss = []
     train_accs = []
 
-    for batch in tqdm(train_loader):
+    for batch_idx, batch in enumerate(tqdm(train_loader)):
         # A batch consists of image data and corresponding labels.
         imgs, labels = batch
         # imgs = imgs.half()
@@ -225,6 +225,18 @@ for epoch in range(n_epochs):
         # Record the loss and accuracy.
         train_loss.append(loss.item())
         train_accs.append(acc)
+
+        global_step += 1
+        
+        # Log every 10 steps
+        if global_step % 10 == 0:
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f'Step {global_step}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}')
+            wandb.log({
+                "step": global_step,
+                "step_loss": loss.item(),
+                "learning_rate": current_lr
+            })
 
     train_loss = sum(train_loss) / len(train_loss)
     train_acc = sum(train_accs) / len(train_accs)
@@ -273,10 +285,15 @@ for epoch in range(n_epochs):
     valid_loss = sum(valid_loss) / len(valid_loss)
     valid_acc = sum(valid_accs) / len(valid_accs)
 
-    # Log validation metrics
+    # Update learning rate with cosine scheduler
+    scheduler.step()  # ReduceLROnPlateau와 달리 인자 없이 호출
+
+    # Log validation metrics and current learning rate
+    current_lr = optimizer.param_groups[0]['lr']
     wandb.log({
         "valid_loss": valid_loss,
         "valid_acc": valid_acc,
+        "learning_rate": current_lr
     })
 
     # Print the information.
