@@ -196,9 +196,9 @@ class ResNet50(nn.Module):
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
-        "learning_rate": 0.0005,
-        "epochs": 100,
-        "batch_size": 64,
+        "learning_rate": 0.0006,
+        "epochs": 200,
+        "batch_size": 128,
         "model": "ResNet50",
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingLR",
@@ -207,7 +207,7 @@ def main():
     })
     
     # Hyperparameters
-    batch_size = 32
+    batch_size = 128
     n_epochs = 200
     patience = 20  # Number of epochs to wait for improvement
     
@@ -247,10 +247,10 @@ def main():
     })
     
     # Optimizer with weight decay for regularization
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=2e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0006, weight_decay=2e-5)
     
     # Learning rate scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=10, eta_min=2e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=20, eta_min=3e-4)
     
     # Training tracking variables
     stale = 0
