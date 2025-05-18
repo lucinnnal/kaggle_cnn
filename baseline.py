@@ -11,6 +11,7 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
 from torchvision.datasets import DatasetFolder, VisionDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR
 import wandb
+from utils import calculate_class_weights
 
 # This is for the progress bar.
 from tqdm.auto import tqdm
@@ -37,13 +38,17 @@ train_tfm = transforms.Compose([
     # Random horizontal flip
     transforms.RandomHorizontalFlip(p=0.5),
     # Convert to tensor
-    transforms.ToTensor()
+    transforms.ToTensor(),
+    # Normalize the image
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+
 ])
 
 # Test/validation transformations
 test_tfm = transforms.Compose([
     transforms.Resize((224, 224)),
-    transforms.ToTensor()
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 
@@ -73,55 +78,93 @@ class FoodDataset(Dataset):
             return im, label
 
 
-class ImprovedClassifier(nn.Module):
-    def __init__(self, num_classes=11):
-        super(ImprovedClassifier, self).__init__()
-        # Simpler CNN with fewer blocks
-        self.block1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 1, 1),      # [32, 224, 224]
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)               # [32, 112, 112]
-        )
+class BasicBlock(nn.Module):
+    expansion = 1
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(BasicBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
         
-        self.block2 = nn.Sequential(
-            nn.Conv2d(32, 64, 3, 1, 1),     # [64, 112, 112]
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion*planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion*planes)
+            )
+
+    def forward(self, x):
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)
+        out = torch.relu(out)
+        return out
+
+class Bottleneck(nn.Module):
+    expansion = 4
+
+    def __init__(self, in_planes, planes, stride=1):
+        super(Bottleneck, self).__init__()
+        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(planes)
+        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(planes)
+        self.conv3 = nn.Conv2d(planes, planes * self.expansion, kernel_size=1, bias=False)
+        self.bn3 = nn.BatchNorm2d(planes * self.expansion)
+
+        self.shortcut = nn.Sequential()
+        if stride != 1 or in_planes != self.expansion * planes:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_planes, self.expansion * planes, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(self.expansion * planes)
+            )
+
+    def forward(self, x):
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = torch.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
+        out += self.shortcut(x)
+        out = torch.relu(out)
+        return out
+
+class ResNet50(nn.Module):
+    def __init__(self, num_classes=11):
+        super(ResNet50, self).__init__()
+        self.in_planes = 64
+
+        # Initial convolution layer
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)               # [64, 56, 56]
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
-        
-        self.block3 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 1, 1),    # [128, 56, 56]
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, 1, 1),   # [128, 56, 56]
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)               # [128, 28, 28]
-        )
-        
-        self.block4 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 1, 1),   # [256, 28, 28]
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)               # [256, 14, 14]
-        )
-        
-        # Global average pooling
+
+        # ResNet stages
+        self.layer1 = self._make_layer(Bottleneck, 64, 3, stride=1)  # 64*4 = 256 channels
+        self.layer2 = self._make_layer(Bottleneck, 128, 4, stride=2) # 128*4 = 512 channels
+        self.layer3 = self._make_layer(Bottleneck, 256, 6, stride=2) # 256*4 = 1024 channels
+        self.layer4 = self._make_layer(Bottleneck, 512, 3, stride=2) # 512*4 = 2048 channels
+
+        # Global average pooling and classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        
-        # Simplified classifier
-        self.classifier = nn.Sequential(
-            nn.Dropout(0.4),
-            nn.Linear(256, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.4),
-            nn.Linear(512, num_classes)
+        self.fc = nn.Sequential(
+            nn.Linear(512 * Bottleneck.expansion, num_classes)
         )
-        
+
+        # Weight initialization
         self._initialize_weights()
-    
+
+    def _make_layer(self, block, planes, num_blocks, stride):
+        strides = [stride] + [1] * (num_blocks - 1)
+        layers = []
+        for stride in strides:
+            layers.append(block(self.in_planes, planes, stride))
+            self.in_planes = planes * block.expansion
+        return nn.Sequential(*layers)
+
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -136,13 +179,17 @@ class ImprovedClassifier(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        x = self.block1(x)
-        x = self.block2(x)
-        x = self.block3(x)
-        x = self.block4(x)
-        x = self.avgpool(x)
+        x = self.conv1(x)      # [B, 64, 56, 56]
+        
+        x = self.layer1(x)     # [B, 256, 56, 56]
+        x = self.layer2(x)     # [B, 512, 28, 28]
+        x = self.layer3(x)     # [B, 1024, 14, 14]
+        x = self.layer4(x)     # [B, 2048, 7, 7]
+        
+        x = self.avgpool(x)    # [B, 2048, 1, 1]
         x = x.view(x.size(0), -1)
-        x = self.classifier(x)
+        x = self.fc(x)
+        
         return x
 
 
@@ -152,43 +199,58 @@ def main():
         "learning_rate": 0.0005,
         "epochs": 100,
         "batch_size": 64,
-        "model": "ImprovedClassifier",
+        "model": "ResNet50",
         "optimizer": "AdamW",
-        "scheduler": "CosineAnnealingLR"
+        "scheduler": "CosineAnnealingLR",
+        "weight_decay": 2e-5,
+        "label_smoothing": 0.1
     })
     
     # Hyperparameters
-    batch_size = 64
-    n_epochs = 100
-    patience = 10  # Number of epochs to wait for improvement
+    batch_size = 32
+    n_epochs = 200
+    patience = 20  # Number of epochs to wait for improvement
     
     # Dataset directory
     _dataset_dir = "/content/data/"
     
+    # Calculate class weights from training set
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
+    
     # Construct datasets
     train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False)
     
     # Device configuration
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
     # Initialize model
-    model = ImprovedClassifier(num_classes=11).to(device)
+    model = ResNet50(num_classes=11).to(device)
     
     # Initialize wandb to watch the model
     wandb.watch(model, log="all")
     
     # Loss function (with label smoothing for better generalization)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights,
+        label_smoothing=0.1
+    )
+    
+    # Update wandb config to include class weights information
+    wandb.config.update({
+        "class_weights_enabled": True,
+        "class_weights": class_weights.cpu().tolist()
+    })
     
     # Optimizer with weight decay for regularization
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=2e-5)
     
     # Learning rate scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=20, eta_min=2e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=10, eta_min=2e-4)
     
     # Training tracking variables
     stale = 0
@@ -331,7 +393,7 @@ def test_prediction():
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     # Load best model
-    model_best = ImprovedClassifier(num_classes=11).to(device)
+    model_best = ResNet50(num_classes=11).to(device)
     checkpoint = torch.load(f"{_exp_name}_best.ckpt")
     model_best.load_state_dict(checkpoint['model_state_dict'])
     model_best.eval()
