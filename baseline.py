@@ -33,9 +33,7 @@ if torch.cuda.is_available():
 # Enhanced data transformations for training with various augmentations
 train_tfm = transforms.Compose([
     # Resize the image into a fixed shape
-    transforms.Resize((144, 144)),
-    # Random crop to 128x128
-    transforms.RandomCrop(128),
+    transforms.Resize((224, 224)),
     # Random horizontal flip
     transforms.RandomHorizontalFlip(p=0.5),
     # Convert to tensor
@@ -44,7 +42,7 @@ train_tfm = transforms.Compose([
 
 # Test/validation transformations
 test_tfm = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor()
 ])
 
@@ -78,80 +76,52 @@ class FoodDataset(Dataset):
 class ImprovedClassifier(nn.Module):
     def __init__(self, num_classes=11):
         super(ImprovedClassifier, self).__init__()
-        # Improved CNN with residual connections
-        # Each block consists of two convolutional layers with batch normalization and ReLU
+        # Simpler CNN with fewer blocks
         self.block1 = nn.Sequential(
-            nn.Conv2d(3, 64, 3, 1, 1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(3, 32, 3, 1, 1),      # [32, 224, 224]
+            nn.BatchNorm2d(32),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, 3, 1, 1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)
+            nn.MaxPool2d(2, 2)               # [32, 112, 112]
         )
         
         self.block2 = nn.Sequential(
-            nn.Conv2d(64, 128, 3, 1, 1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(32, 64, 3, 1, 1),     # [64, 112, 112]
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.Conv2d(128, 128, 3, 1, 1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)
+            nn.MaxPool2d(2, 2)               # [64, 56, 56]
         )
         
         self.block3 = nn.Sequential(
-            nn.Conv2d(128, 256, 3, 1, 1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(64, 128, 3, 1, 1),    # [128, 56, 56]
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3, 1, 1),
-            nn.BatchNorm2d(256),
+            nn.Conv2d(128, 128, 3, 1, 1),   # [128, 56, 56]
+            nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 256, 3, 1, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)
+            nn.MaxPool2d(2, 2)               # [128, 28, 28]
         )
         
         self.block4 = nn.Sequential(
-            nn.Conv2d(256, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
+            nn.Conv2d(128, 256, 3, 1, 1),   # [256, 28, 28]
+            nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)
+            nn.MaxPool2d(2, 2)               # [256, 14, 14]
         )
         
-        self.block5 = nn.Sequential(
-            nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2)
-        )
+        # Global average pooling
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         
-        # Adaptive pooling to handle different input sizes
-        self.avgpool = nn.AdaptiveAvgPool2d((4, 4))
-        
-        # Fully connected layers with dropout for regularization
+        # Simplified classifier
         self.classifier = nn.Sequential(
-            nn.Linear(512 * 4 * 4, 1024),
+            nn.Dropout(0.4),
+            nn.Linear(256, 512),
             nn.ReLU(inplace=True),
-            nn.Linear(1024, num_classes)
+            nn.Dropout(0.4),
+            nn.Linear(512, num_classes)
         )
         
-        # Initialize weights
         self._initialize_weights()
-        
+    
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -170,7 +140,6 @@ class ImprovedClassifier(nn.Module):
         x = self.block2(x)
         x = self.block3(x)
         x = self.block4(x)
-        x = self.block5(x)
         x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         x = self.classifier(x)
@@ -180,17 +149,17 @@ class ImprovedClassifier(nn.Module):
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
-        "learning_rate": 0.0008,
-        "epochs": 30,
-        "batch_size": 128,
+        "learning_rate": 0.0005,
+        "epochs": 100,
+        "batch_size": 64,
         "model": "ImprovedClassifier",
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingLR"
     })
     
     # Hyperparameters
-    batch_size = 128
-    n_epochs = 30
+    batch_size = 64
+    n_epochs = 100
     patience = 10  # Number of epochs to wait for improvement
     
     # Dataset directory
@@ -216,10 +185,10 @@ def main():
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     
     # Optimizer with weight decay for regularization
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0008, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
     
     # Learning rate scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=20, eta_min=2e-4)
     
     # Training tracking variables
     stale = 0
