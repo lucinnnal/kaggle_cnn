@@ -77,7 +77,6 @@ class FoodDataset(Dataset):
             label = int(fname.split("/")[-1].split("_")[0])
             return im, label
 
-
 class BasicBlock(nn.Module):
     expansion = 1
 
@@ -102,10 +101,10 @@ class BasicBlock(nn.Module):
         out = torch.relu(out)
         return out
 
-class ResNet34(nn.Module):
+class ResNet18(nn.Module):
     def __init__(self, num_classes=11):
-        super(ResNet34, self).__init__()
-        self.in_planes = 32  # 채널 수를 줄임 (기존 64에서 32로)
+        super(ResNet18, self).__init__()
+        self.in_planes = 32  # 채널 수를 줄임
 
         # Initial convolution layer for 128x128 input
         self.conv1 = nn.Sequential(
@@ -115,15 +114,16 @@ class ResNet34(nn.Module):
             nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # [32, 64, 64]
         )
 
-        # ResNet stages with BasicBlock
-        self.layer1 = self._make_layer(BasicBlock, 32, 3, stride=1)    # [32, 64, 64]
-        self.layer2 = self._make_layer(BasicBlock, 64, 4, stride=2)    # [64, 32, 32]
-        self.layer3 = self._make_layer(BasicBlock, 128, 6, stride=2)   # [128, 16, 16]
-        self.layer4 = self._make_layer(BasicBlock, 256, 3, stride=2)   # [256, 8, 8]
+        # ResNet stages with BasicBlock - [2,2,2,2] configuration
+        self.layer1 = self._make_layer(BasicBlock, 32, 2, stride=1)    # [32, 64, 64]
+        self.layer2 = self._make_layer(BasicBlock, 64, 2, stride=2)    # [64, 32, 32]
+        self.layer3 = self._make_layer(BasicBlock, 128, 2, stride=2)   # [128, 16, 16]
+        self.layer4 = self._make_layer(BasicBlock, 256, 2, stride=2)   # [256, 8, 8]
 
         # Global average pooling and classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Sequential(
+            nn.Dropout(0.4),
             nn.Linear(256 * BasicBlock.expansion, num_classes)
         )
 
@@ -200,7 +200,7 @@ def main():
     print(f"Using device: {device}")
     
     # Initialize model
-    model = ResNet34(num_classes=11).to(device)
+    model = ResNet18(num_classes=11).to(device)
     
     # Initialize wandb to watch the model
     wandb.watch(model, log="all")
@@ -364,7 +364,7 @@ def test_prediction():
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     # Load best model
-    model_best = ResNet50(num_classes=11).to(device)
+    model_best = ResNet18(num_classes=11).to(device)
     checkpoint = torch.load(f"{_exp_name}_best.ckpt")
     model_best.load_state_dict(checkpoint['model_state_dict'])
     model_best.eval()
