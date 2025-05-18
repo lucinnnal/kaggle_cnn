@@ -102,27 +102,25 @@ class BasicBlock(nn.Module):
 class ResNet(nn.Module):
     def __init__(self, block, num_blocks, num_classes=11):
         super(ResNet, self).__init__()
-        self.in_planes = 64
+        # 초기 채널 수를 32로 줄임 (기존 64)
+        self.in_planes = 32
 
-        # Initial convolution layer
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        # 초기 컨볼루션 레이어 - 커널 크기와 stride 줄임
+        self.conv1 = nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(32)
         
-        # ResNet layers
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
+        # ResNet 레이어 - 블록 수와 채널 수 감소
+        self.layer1 = self._make_layer(block, 32, num_blocks[0], stride=1)
+        self.layer2 = self._make_layer(block, 64, num_blocks[1], stride=2)
+        self.layer3 = self._make_layer(block, 128, num_blocks[2], stride=2)
         
         # Global average pooling and classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Sequential(
             nn.Dropout(0.2),
-            nn.Linear(512 * block.expansion, num_classes)
+            nn.Linear(128 * block.expansion, num_classes)
         )
 
-        # Initialize weights
         self._initialize_weights()
 
     def _make_layer(self, block, planes, num_blocks, stride):
@@ -153,7 +151,6 @@ class ResNet(nn.Module):
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)
-        out = self.layer4(out)
         
         # Global average pooling and FC layer
         out = self.avgpool(out)
@@ -161,27 +158,28 @@ class ResNet(nn.Module):
         out = self.fc(out)
         return out
 
-# ResNet18 생성 함수
+# ResNet 생성 함수 수정
 def create_model(num_classes=11):
-    return ResNet(BasicBlock, [2, 2, 2, 2], num_classes)  # ResNet18 configuration
+    # 레이어 수를 [1,1,1]로 줄임 (기존 [2,2,2,2])
+    return ResNet(BasicBlock, [1, 1, 1], num_classes)
 
 
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
-        "learning_rate": 0.0005,
+        "learning_rate": 0.0003,
         "epochs": 100,
-        "batch_size": 128,
+        "batch_size": 64,
         "model": "ResNet18-modified",
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingLR",
-        "eta_min": 2e-4,
-        "T_max": 50,
+        "eta_min": 1e-4,
+        "T_max": 30,
         "label_smoothing": 0
     })
     
     # Hyperparameters
-    batch_size = 128
+    batch_size = 64
     n_epochs = 100
     patience = 10  # Number of epochs to wait for improvement
     
@@ -190,9 +188,9 @@ def main():
     
     # Construct datasets
     train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
     valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False)
     
     # Device configuration
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -208,10 +206,10 @@ def main():
     criterion = nn.CrossEntropyLoss()
     
     # Optimizer with weight decay for regularization
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-4)
     
     # Learning rate scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=2e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=30, eta_min=1e-4)
     
     # Training tracking variables
     stale = 0
