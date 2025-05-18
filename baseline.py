@@ -9,49 +9,53 @@ from PIL import Image
 # "ConcatDataset" and "Subset" are possibly useful when doing semi-supervised learning.
 from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
 from torchvision.datasets import DatasetFolder, VisionDataset
+from torch.optim.lr_scheduler import CosineAnnealingLR
+import wandb
 
 # This is for the progress bar.
 from tqdm.auto import tqdm
 import random
 
-# Import wandb at the top of the file
-import wandb
+# Set experiment name and wandb project
+_exp_name = "food_classification_improved"
+project_name = "food_classification"
 
-myseed = 6666  # set a random seed for reproducibility
+# Set a random seed for reproducibility
+myseed = 6666
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 np.random.seed(myseed)
 torch.manual_seed(myseed)
+random.seed(myseed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(myseed)
 
-
-# Normally, We don't need augmentations in testing and validation.
-# All we need here is to resize the PIL image and transform it into Tensor.
-test_tfm = transforms.Compose([
-    transforms.Resize((128, 128)),  # Resize the image into a fixed shape (height = width = 512)
-    transforms.ToTensor(),
+# Enhanced data transformations for training with various augmentations
+train_tfm = transforms.Compose([
+    # Resize the image into a fixed shape
+    transforms.Resize((144, 144)),
+    # Random crop to 128x128
+    transforms.RandomCrop(128),
+    # Random horizontal flip
+    transforms.RandomHorizontalFlip(p=0.5),
+    # Convert to tensor
+    transforms.ToTensor()
 ])
 
-# However, it is also possible to use augmentation in the testing phase.
-# You may use train_tfm to produce a variety of images and then test using ensemble methods
-train_tfm = transforms.Compose([
-    # Resize the image into a fixed shape (height = width = 128)
-    # You may add some transforms here.
-    # ToTensor() should be the last one of the transforms.
+# Test/validation transformations
+test_tfm = transforms.Compose([
     transforms.Resize((128, 128)),
-    transforms.ToTensor(),
+    transforms.ToTensor()
 ])
 
 
 class FoodDataset(Dataset):
-
     def __init__(self, path, tfm=test_tfm, files=None, is_test=False):
         super(FoodDataset).__init__()
         self.path = path
         self.is_test = is_test
         self.files = sorted([os.path.join(path, x) for x in os.listdir(path) if x.endswith(".jpg")])
-        if files != None:
+        if files is not None:
             self.files = files
         print(f"One {path} sample", self.files[0])
         self.transform = tfm
@@ -61,7 +65,7 @@ class FoodDataset(Dataset):
 
     def __getitem__(self, idx):
         fname = self.files[idx]
-        im = Image.open(fname)
+        im = Image.open(fname).convert('RGB')  # Ensure RGB format
         im = self.transform(im)
         file_id = os.path.basename(fname).split(".")[0]  # Extract the ID from the filename
         if self.is_test:
@@ -71,285 +75,316 @@ class FoodDataset(Dataset):
             return im, label
 
 
-class Classifier(nn.Module):
-    def __init__(self):
-        super(Classifier, self).__init__()
-        # input dimension [3, 128, 128]
-        self.cnn = nn.Sequential(
-            # First block
-            nn.Conv2d(3, 64, 3, 1, 1),      # [64, 128, 128]
+class ImprovedClassifier(nn.Module):
+    def __init__(self, num_classes=11):
+        super(ImprovedClassifier, self).__init__()
+        # Improved CNN with residual connections
+        # Each block consists of two convolutional layers with batch normalization and ReLU
+        self.block1 = nn.Sequential(
+            nn.Conv2d(3, 64, 3, 1, 1),
             nn.BatchNorm2d(64),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [64, 64, 64]
-            
-            # Second block
-            nn.Conv2d(64, 128, 3, 1, 1),    # [128, 64, 64]
-            nn.BatchNorm2d(128),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [128, 32, 32]
-            
-            # Third block
-            nn.Conv2d(128, 256, 3, 1, 1),   # [256, 32, 32]
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.Conv2d(256, 256, 3, 1, 1),   # [256, 32, 32]
-            nn.BatchNorm2d(256),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [256, 16, 16]
-            
-            # Fourth block
-            nn.Conv2d(256, 512, 3, 1, 1),   # [512, 16, 16]
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.Conv2d(512, 512, 3, 1, 1),   # [512, 16, 16]
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [512, 8, 8]
-            
-            # Fifth block
-            nn.Conv2d(512, 512, 3, 1, 1),   # [512, 8, 8]
-            nn.BatchNorm2d(512),
-            nn.ReLU(),
-            nn.MaxPool2d(2, 2, 0),          # [512, 4, 4]
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
         )
         
-        self.fc = nn.Sequential(
-            nn.Linear(512 * 4 * 4, 1024),
-            nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.ReLU(),
-            nn.Linear(512, 11)
+        self.block2 = nn.Sequential(
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
         )
+        
+        self.block3 = nn.Sequential(
+            nn.Conv2d(128, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
+        )
+        
+        self.block4 = nn.Sequential(
+            nn.Conv2d(256, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
+        )
+        
+        self.block5 = nn.Sequential(
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.ReLU(inplace=True),
+            nn.MaxPool2d(2, 2)
+        )
+        
+        # Adaptive pooling to handle different input sizes
+        self.avgpool = nn.AdaptiveAvgPool2d((4, 4))
+        
+        # Fully connected layers with dropout for regularization
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 4 * 4, 1024),
+            nn.ReLU(inplace=True),
+            nn.Linear(1024, num_classes)
+        )
+        
+        # Initialize weights
+        self._initialize_weights()
+        
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        out = self.cnn(x)
-        out = out.view(out.size()[0], -1)
-        return self.fc(out)
-
-batch_size = 64
-_dataset_dir = "/content/data/"
-# Construct datasets.
-# The argument "loader" tells how torchvision reads the data.
-train_set = FoodDataset(os.path.join(_dataset_dir,"train"), tfm=train_tfm)
-train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
-valid_set = FoodDataset(os.path.join(_dataset_dir,"validation"), tfm=test_tfm)
-valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_workers=0, pin_memory=True)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        x = self.block5(x)
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.classifier(x)
+        return x
 
 
-# "cuda" only when GPUs are available.
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-# The number of training epochs and patience.
-n_epochs = 30
-patience = 300  # If no improvement in 'patience' epochs, early stop
-
-# Initialize a model, and put it on the device specified.
-model = Classifier().to(device)
-
-# For the classification task, we use cross-entropy as the measurement of performance.
-criterion = nn.CrossEntropyLoss()
-
-# Initialize optimizer and scheduler
-optimizer = torch.optim.Adam(model.parameters(), lr=0.01)
-scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-    optimizer,
-    T_max=5,    # 전체 에폭 수
-    eta_min=1e-6       # 최소 학습률
-)
-
-# Initialize wandb before training
-wandb.init(
-    project="food-classification",
-    config={
-        "architecture": "Custom_CNN",
-        "dataset": "Food-11",
-        "epochs": n_epochs,
-        "batch_size": batch_size,
-        "learning_rate": 0.01,
-        "scheduler": "CosineAnnealingLR",  # 스케줄러 이름 변경
-        "T_max": 5,
-        "optimizer": "Adam",
-        "min_lr": 1e-6
-    }
-)
-
-# Watch the model
-wandb.watch(model)
-
-# Initialize trackers, these are not parameters and should not be changed
-stale = 0
-best_acc = 0
-_exp_name = "food_classification_experiment_Simple"
-
-# Initialize step counter
-global_step = 0
-
-for epoch in range(n_epochs):
-
-    # ---------- Training ----------
-    # Make sure the model is in train mode before training.
-    model.train()
-
-    # These are used to record information in training.
-    train_loss = []
-    train_accs = []
-
-    for batch_idx, batch in enumerate(tqdm(train_loader)):
-        # A batch consists of image data and corresponding labels.
-        imgs, labels = batch
-        # imgs = imgs.half()
-        # print(imgs.shape,labels.shape)
-
-        # Forward the data. (Make sure data and model are on the same device.)
-        logits = model(imgs.to(device))
-
-        # Calculate the cross-entropy loss.
-        # We don't need to apply softmax before computing cross-entropy as it is done automatically.
-        loss = criterion(logits, labels.to(device))
-
-        # Gradients stored in the parameters in the previous step should be cleared out first.
-        optimizer.zero_grad()
-
-        # Compute the gradients for parameters.
-        loss.backward()
-
-        # Clip the gradient norms for stable training.
-        grad_norm = nn.utils.clip_grad_norm_(model.parameters(), max_norm=10)
-
-        # Update the parameters with computed gradients.
-        optimizer.step()
-
-        # Compute the accuracy for current batch.
-        acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
-
-        # Record the loss and accuracy.
-        train_loss.append(loss.item())
-        train_accs.append(acc)
-
-        global_step += 1
+def main():
+    # Initialize wandb
+    wandb.init(project=project_name, name=_exp_name, config={
+        "learning_rate": 0.0008,
+        "epochs": 30,
+        "batch_size": 128,
+        "model": "ImprovedClassifier",
+        "optimizer": "AdamW",
+        "scheduler": "CosineAnnealingLR"
+    })
+    
+    # Hyperparameters
+    batch_size = 128
+    n_epochs = 30
+    patience = 10  # Number of epochs to wait for improvement
+    
+    # Dataset directory
+    _dataset_dir = "/content/data/"
+    
+    # Construct datasets
+    train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    
+    # Device configuration
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # Initialize model
+    model = ImprovedClassifier(num_classes=11).to(device)
+    
+    # Initialize wandb to watch the model
+    wandb.watch(model, log="all")
+    
+    # Loss function (with label smoothing for better generalization)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    # Optimizer with weight decay for regularization
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0008, weight_decay=1e-4)
+    
+    # Learning rate scheduler
+    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-4)
+    
+    # Training tracking variables
+    stale = 0
+    best_acc = 0
+    
+    # Training and validation loop
+    for epoch in range(n_epochs):
+        # ---------- Training ----------
+        model.train()
+        train_loss = []
+        train_accs = []
         
-        # Log every 10 steps
-        if global_step % 10 == 0:
-            current_lr = optimizer.param_groups[0]['lr']
-            print(f'Step {global_step}, Loss: {loss.item():.4f}, LR: {current_lr:.6f}')
-            wandb.log({
-                "step": global_step,
-                "step_loss": loss.item(),
-                "learning_rate": current_lr
-            })
-
-    train_loss = sum(train_loss) / len(train_loss)
-    train_acc = sum(train_accs) / len(train_accs)
-
-    # Log training metrics
-    wandb.log({
-        "epoch": epoch + 1,
-        "train_loss": train_loss,
-        "train_acc": train_acc,
-    })
-
-    # Print the information.
-    print(f"[ Train | {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
-
-    # ---------- Validation ----------
-    # Make sure the model is in eval mode so that some modules like dropout are disabled and work normally.
-    model.eval()
-
-    # These are used to record information in validation.
-    valid_loss = []
-    valid_accs = []
-
-    # Iterate the validation set by batches.
-    for batch in tqdm(valid_loader):
-        # A batch consists of image data and corresponding labels.
-        imgs, labels = batch
-        # imgs = imgs.half()
-
-        # We don't need gradient in validation.
-        # Using torch.no_grad() accelerates the forward process.
-        with torch.no_grad():
+        # Progress bar for training
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Train]")
+        
+        for batch in train_pbar:
+            # Get data and labels
+            imgs, labels = batch
+            
+            # Forward pass
             logits = model(imgs.to(device))
-
-        # We can still compute the loss (but not the gradient).
-        loss = criterion(logits, labels.to(device))
-
-        # Compute the accuracy for current batch.
-        acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
-
-        # Record the loss and accuracy.
-        valid_loss.append(loss.item())
-        valid_accs.append(acc)
-        # break
-
-    # The average loss and accuracy for entire validation set is the average of the recorded values.
-    valid_loss = sum(valid_loss) / len(valid_loss)
-    valid_acc = sum(valid_accs) / len(valid_accs)
-
-    # Update learning rate with cosine scheduler
-    scheduler.step()  # ReduceLROnPlateau와 달리 인자 없이 호출
-
-    # Log validation metrics and current learning rate
-    current_lr = optimizer.param_groups[0]['lr']
-    wandb.log({
-        "valid_loss": valid_loss,
-        "valid_acc": valid_acc,
-        "learning_rate": current_lr
-    })
-
-    # Print the information.
-    print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
-
-    # update logs
-    if valid_acc > best_acc:
-        with open(f"./{_exp_name}_log.txt", "a"):
-            print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f} -> best")
-    else:
-        with open(f"./{_exp_name}_log.txt", "a"):
-            print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
-
-    # save models
-    if valid_acc > best_acc:
-        # Log best model metrics
+            loss = criterion(logits, labels.to(device))
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            # Calculate accuracy
+            acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+            
+            # Record metrics
+            train_loss.append(loss.item())
+            train_accs.append(acc.item())
+            
+            # Update progress bar
+            train_pbar.set_postfix(
+                {"loss": sum(train_loss) / len(train_loss), "acc": sum(train_accs) / len(train_accs)}
+            )
+        
+        # Calculate epoch metrics
+        train_loss = sum(train_loss) / len(train_loss)
+        train_acc = sum(train_accs) / len(train_accs)
+        
+        # Log metrics to wandb
         wandb.log({
-            "best_valid_acc": valid_acc,
-            "best_epoch": epoch + 1
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "epoch": epoch + 1
         })
         
-        # Save model to wandb
-        torch.save(model.state_dict(), os.path.join(wandb.run.dir, f"{_exp_name}_best.ckpt"))
+        # Print training info
+        print(f"[ Train | {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
+        
+        # ---------- Validation ----------
+        model.eval()
+        valid_loss = []
+        valid_accs = []
+        
+        # Progress bar for validation
+        valid_pbar = tqdm(valid_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Valid]")
+        
+        with torch.no_grad():
+            for batch in valid_pbar:
+                imgs, labels = batch
+                logits = model(imgs.to(device))
+                loss = criterion(logits, labels.to(device))
+                acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+                
+                # Record metrics
+                valid_loss.append(loss.item())
+                valid_accs.append(acc.item())
+                
+                # Update progress bar
+                valid_pbar.set_postfix(
+                    {"loss": sum(valid_loss) / len(valid_loss), "acc": sum(valid_accs) / len(valid_accs)}
+                )
+        
+        # Calculate epoch metrics
+        valid_loss = sum(valid_loss) / len(valid_loss)
+        valid_acc = sum(valid_accs) / len(valid_accs)
+        
+        # Log metrics to wandb
+        wandb.log({
+            "valid_loss": valid_loss,
+            "valid_acc": valid_acc,
+            "epoch": epoch + 1
+        })
+        
+        # Print validation info
+        print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
+        
+        # Update learning rate
+        scheduler.step()
+        
+        # Check for improvement
+        if valid_acc > best_acc:
+            print(f"Best model found at epoch {epoch + 1}, saving model")
+            best_acc = valid_acc
+            stale = 0
+            
+            # Save checkpoint
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'best_acc': best_acc,
+            }, f"{_exp_name}_best.ckpt")
+            
+            # Log best model to wandb
+            wandb.run.summary["best_accuracy"] = best_acc
+            wandb.run.summary["best_epoch"] = epoch + 1
+            
+        else:
+            stale += 1
+            print(f"No improvement in validation accuracy for {stale} epochs")
+            if stale >= patience:
+                print(f"Early stopping after {patience} epochs without improvement")
+                break
+    
+    # Finish wandb run
+    wandb.finish()
+    
+    # Test prediction
+    test_prediction()
+    
 
-        print(f"Best model found at epoch {epoch}, saving model")
-        torch.save(model.state_dict(), f"{_exp_name}_best.ckpt")  # only save best to prevent output memory exceed error
-        best_acc = valid_acc
-        stale = 0
-    else:
-        stale += 1
-        if stale > patience:
-            print(f"No improvment {patience} consecutive epochs, early stopping")
-            break
+def test_prediction():
+    _dataset_dir = "/content/data/"
+    _exp_name = "food_classification_improved"
+    batch_size = 64
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Load test dataset
+    test_set = FoodDataset(os.path.join(_dataset_dir, "test"), tfm=test_tfm, is_test=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    
+    # Load best model
+    model_best = ImprovedClassifier(num_classes=11).to(device)
+    checkpoint = torch.load(f"{_exp_name}_best.ckpt")
+    model_best.load_state_dict(checkpoint['model_state_dict'])
+    model_best.eval()
+    
+    # Prediction with tqdm progress bar
+    prediction = []
+    file_ids = []
+    
+    with torch.no_grad():
+        for data, _, file_id in tqdm(test_loader, desc="Generating predictions"):
+            test_pred = model_best(data.to(device))
+            test_label = np.argmax(test_pred.cpu().data.numpy(), axis=1)
+            prediction += test_label.squeeze().tolist()
+            file_ids += file_id  # Append original IDs
+    
+    # Create submission CSV
+    df = pd.DataFrame()
+    df["ID"] = file_ids
+    df["Category"] = prediction
+    df.to_csv("submission.csv", index=False)
+    print("Submission file created successfully!")
 
-# Close wandb run at the end
-wandb.finish()
 
-test_set = FoodDataset(os.path.join(_dataset_dir,"test"), tfm=test_tfm, is_test=True)
-test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=True)
-
-model_best = Classifier().to(device)
-model_best.load_state_dict(torch.load(f"{_exp_name}_best.ckpt"))
-model_best.eval()
-prediction = []
-file_ids = []  # To store file IDs for each image
-
-with torch.no_grad():
-    for data,_,file_id in test_loader:
-        test_pred = model_best(data.to(device))
-        test_label = np.argmax(test_pred.cpu().data.numpy(), axis=1)
-        prediction += test_label.squeeze().tolist()
-        file_ids += file_id  # Append original IDs
-
-
-#create test csv
-df = pd.DataFrame()
-df["ID"] = file_ids
-df["Category"] = prediction
-df.to_csv("submission.csv",index = False)
+if __name__ == "__main__":
+    main()
