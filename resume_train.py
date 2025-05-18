@@ -6,6 +6,7 @@ from tqdm.auto import tqdm
 import torch.nn as nn
 import os
 from baseline import ImprovedClassifier, FoodDataset, train_tfm, test_tfm
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 def resume_training():
     # Hyperparameters
@@ -26,10 +27,10 @@ def resume_training():
     model = ImprovedClassifier(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0008, weight_decay=1e-4)
-    scheduler = torch.optim.CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-4)
+    scheduler = CosineAnnealingLR(optimizer, T_max=n_epochs, eta_min=1e-4)
 
     # Load checkpoint
-    checkpoint = torch.load(f"{_exp_name}_best.ckpt")
+    checkpoint = torch.load("/content/drive/MyDrive/food_classification_improved_best.ckpt")
     model.load_state_dict(checkpoint['model_state_dict'])
     optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
     scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
