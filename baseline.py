@@ -9,7 +9,7 @@ from PIL import Image
 # "ConcatDataset" and "Subset" are possibly useful when doing semi-supervised learning.
 from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
 from torchvision.datasets import DatasetFolder, VisionDataset
-from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
 import wandb
 from utils import calculate_class_weights
 
@@ -170,10 +170,12 @@ def main():
         "learning_rate": 0.0003,
         "epochs": 200,
         "batch_size": 64,
-        "model": "ResNet50",
+        "model": "ResNet18",
         "optimizer": "AdamW",
-        "scheduler": "CosineAnnealingLR",
-        "weight_decay": 2e-5,
+        "scheduler": "MultiStepLR",
+        "scheduler_milestones": [60, 120, 160],  # Milestones for lr decay
+        "scheduler_gamma": 0.1,  # Learning rate decay factor
+        "weight_decay": 1e-5,
         "label_smoothing": 0.1
     })
     
@@ -220,8 +222,12 @@ def main():
     # Optimizer with weight decay for regularization
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-5)
     
-    # Learning rate scheduler
-    scheduler = CosineAnnealingLR(optimizer, T_max=50, eta_min=2e-4)
+    # Change learning rate scheduler to MultiStepLR
+    scheduler = MultiStepLR(
+        optimizer,
+        milestones=[30, 50, 70],  # Decrease lr at epochs 60, 120, and 160
+        gamma=0.7  # Multiply lr by 0.1 at each milestone
+    )
     
     # Training tracking variables
     stale = 0
