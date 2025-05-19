@@ -167,7 +167,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ep
         
         acc = (logits.argmax(dim=-1) == labels).float().mean()
         train_loss.append(loss.item())
-        train_accs.append(acc)
+        train_accs.append(acc.cpu().item())  # Move to CPU before appending
         
         # Log metrics every 10 steps
         if (step + 1) % 10 == 0:
