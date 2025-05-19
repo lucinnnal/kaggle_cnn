@@ -224,12 +224,12 @@ def main():
     })
     
     # Optimizer with weight decay for regularization
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0004, weight_decay=1e-5)
     
     # Change learning rate scheduler to MultiStepLR
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[30, 50, 70],  # Decrease lr at epochs 60, 120, and 160
+        milestones=[30, 50, 70, 90],  # Decrease lr at epochs 60, 120, and 160
         gamma=0.7  # Multiply lr by 0.1 at each milestone
     )
     
