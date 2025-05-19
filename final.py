@@ -202,7 +202,7 @@ def valid_epoch(model, valid_loader, criterion, device):
             
             acc = (logits.argmax(dim=-1) == labels).float().mean()
             valid_loss.append(loss.item())
-            valid_accs.append(acc)
+            valid_accs.append(acc.item())
             
     return np.mean(valid_loss), np.mean(valid_accs)
 
