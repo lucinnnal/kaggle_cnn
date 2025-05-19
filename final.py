@@ -10,6 +10,7 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm.auto import tqdm
 import random
 from sklearn.utils.class_weight import compute_class_weight  # 추가
+import wandb
 
 # 재현성을 위한 시드 설정
 myseed = 6666
@@ -146,12 +147,12 @@ def mixup_data(x, y, alpha=0.2):
     y_a, y_b = y, y[index]
     return mixed_x, y_a, y_b, lam
 
-def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
+def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch):
     model.train()
     train_loss = []
     train_accs = []
     
-    for batch in tqdm(train_loader):
+    for step, batch in enumerate(tqdm(train_loader)):
         imgs, labels = batch
         imgs, labels = imgs.to(device), labels.to(device)
         
@@ -168,6 +169,21 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device):
         train_loss.append(loss.item())
         train_accs.append(acc)
         
+        # Log metrics every 10 steps
+        if (step + 1) % 10 == 0:
+            current_loss = np.mean(train_loss[-10:])
+            current_acc = np.mean(train_accs[-10:])
+            print(f"Epoch [{epoch+1}] Step [{step+1}/{len(train_loader)}] "
+                  f"Loss: {current_loss:.4f} Acc: {current_acc:.4f}")
+            
+            # Log to wandb
+            wandb.log({
+                "train/step": epoch * len(train_loader) + step,
+                "train/step_loss": current_loss,
+                "train/step_acc": current_acc,
+                "train/learning_rate": optimizer.param_groups[0]['lr']
+            })
+    
     scheduler.step()
     return np.mean(train_loss), np.mean(train_accs)
 
@@ -214,6 +230,23 @@ def calculate_class_weights(dataset_path):
     return torch.FloatTensor(weights)
 
 def main():
+    # Initialize wandb
+    wandb.init(
+        project="food-classification",
+        name="enhanced-classifier",
+        config={
+            "architecture": "EnhancedClassifier",
+            "dataset": "Food-11",
+            "learning_rate": 0.001,
+            "epochs": 100,
+            "batch_size": 32,
+            "optimizer": "AdamW",
+            "scheduler": "CosineAnnealingWarmRestarts",
+            "weight_decay": 0.01,
+            "label_smoothing": 0.1
+        }
+    )
+    
     # 하이퍼파라미터 설정
     batch_size = 32
     n_epochs = 100
@@ -240,6 +273,9 @@ def main():
         optimizer, T_0=10, T_mult=2, eta_min=1e-6
     )
     
+    # Watch model
+    wandb.watch(model, criterion, log="all", log_freq=10)
+    
     # 학습 루프
     best_acc = 0
     patience = 20
@@ -247,17 +283,32 @@ def main():
     _exp_name = "food_classification_enhanced"
     
     for epoch in range(n_epochs):
-        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device)
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch)
         valid_loss, valid_acc = valid_epoch(model, valid_loader, criterion, device)
         
         print(f"Epoch {epoch+1}/{n_epochs}")
         print(f"Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}")
         print(f"Valid Loss: {valid_loss:.4f}, Valid Acc: {valid_acc:.4f}")
         
+        # Log epoch metrics to wandb
+        wandb.log({
+            "epoch": epoch + 1,
+            "train/epoch_loss": train_loss,
+            "train/epoch_acc": train_acc,
+            "valid/loss": valid_loss,
+            "valid/acc": valid_acc,
+            "learning_rate": optimizer.param_groups[0]['lr']
+        })
+        
         if valid_acc > best_acc:
             best_acc = valid_acc
             torch.save(model.state_dict(), f"{_exp_name}_best.ckpt")
             print(f"Best model saved! ACC: {best_acc:.4f}")
+            
+            # Log best metrics to wandb
+            wandb.run.summary["best_accuracy"] = best_acc
+            wandb.run.summary["best_epoch"] = epoch + 1
+            
             stale = 0
         else:
             stale += 1
@@ -289,6 +340,9 @@ def main():
         'Category': predictions
     })
     submission.to_csv('submission.csv', index=False)
+    
+    # Close wandb run
+    wandb.finish()
 
 if __name__ == "__main__":
     main()
