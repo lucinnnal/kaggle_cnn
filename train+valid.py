@@ -171,89 +171,83 @@ class ResNet18(nn.Module):
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
-        "learning_rate": 0.0004,
-        "epochs": 100,
+        "learning_rate": 0.0003,
+        "epochs": 200,
         "batch_size": 64,
-        "model": "ResNet18 with train + valid",
+        "model": "ResNet18",
         "optimizer": "AdamW",
         "scheduler": "MultiStepLR",
-        "scheduler_milestones": [30, 50, 70, 90],  # Milestones for lr decay
-        "scheduler_gamma": 0.1,  # Learning rate decay factor
+        "scheduler_milestones": [60, 120, 160],
+        "scheduler_gamma": 0.1,
         "weight_decay": 1e-5,
-        "label_smoothing": 0.1
+        "label_smoothing": 0.1,
+        "training_mode": "combined_train_valid"  # 새로운 설정 추가
     })
     
     # Hyperparameters
     batch_size = 64
     n_epochs = 200
-    patience = 20  # Number of epochs to wait for improvement
     
     # Dataset directory
     _dataset_dir = "/content/data/"
     
-    # Calculate class weights from training set
+    # Calculate class weights using combined dataset
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Combine train and validation datasets
+    train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
+    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=train_tfm)  # validation도 train transform 사용
+    combined_dataset = ConcatDataset([train_set, valid_set])
+    
+    # Calculate class weights from combined dataset
     class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
     
-    # Construct datasets
-    train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
-    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
-    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False)
-    
-    # Device configuration
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    # Create combined dataloader
+    combined_loader = DataLoader(
+        combined_dataset, 
+        batch_size=batch_size, 
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True
+    )
     
     # Initialize model
     model = ResNet18(num_classes=11).to(device)
-    
-    # Initialize wandb to watch the model
     wandb.watch(model, log="all")
     
-    # Loss function (with label smoothing for better generalization)
+    # Loss function
     criterion = nn.CrossEntropyLoss(
         weight=class_weights,
         label_smoothing=0.1
     )
     
-    # Update wandb config to include class weights information
-    wandb.config.update({
-        "class_weights_enabled": True,
-        "class_weights": class_weights.cpu().tolist()
-    })
-    
-    # Optimizer with weight decay for regularization
+    # Optimizer and scheduler
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0004, weight_decay=1e-5)
-    
-    # Change learning rate scheduler to MultiStepLR
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[30, 50, 70, 90],  # Decrease lr at epochs 60, 120, and 160
-        gamma=0.7  # Multiply lr by 0.1 at each milestone
+        milestones=[30, 50, 70, 90],
+        gamma=0.7
     )
     
-    # Training tracking variables
-    stale = 0
-    best_acc = 0
+    # Training loop
+    best_loss = float('inf')
+    _exp_name = "food_classification_improved_combined"
     
-    # Training and validation loop
     for epoch in range(n_epochs):
-        # ---------- Training ----------
         model.train()
         train_loss = []
         train_accs = []
         
-        # Progress bar for training
-        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Train]")
+        # Progress bar
+        pbar = tqdm(combined_loader, desc=f"Epoch {epoch+1}/{n_epochs}")
         
-        for batch in train_pbar:
-            # Get data and labels
+        for step, batch in enumerate(pbar):
             imgs, labels = batch
+            imgs, labels = imgs.to(device), labels.to(device)
             
             # Forward pass
-            logits = model(imgs.to(device))
-            loss = criterion(logits, labels.to(device))
+            logits = model(imgs)
+            loss = criterion(logits, labels)
             
             # Backward and optimize
             optimizer.zero_grad()
@@ -261,100 +255,62 @@ def main():
             optimizer.step()
             
             # Calculate accuracy
-            acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+            acc = (logits.argmax(dim=-1) == labels).float().mean()
             
             # Record metrics
             train_loss.append(loss.item())
             train_accs.append(acc.item())
             
-            # Update progress bar
-            train_pbar.set_postfix(
-                {"loss": sum(train_loss) / len(train_loss), "acc": sum(train_accs) / len(train_accs)}
-            )
+            # Log every 10 steps
+            if (step + 1) % 10 == 0:
+                current_loss = sum(train_loss[-10:]) / 10
+                current_acc = sum(train_accs[-10:]) / 10
+                
+                wandb.log({
+                    "step": epoch * len(combined_loader) + step,
+                    "step_loss": current_loss,
+                    "step_acc": current_acc,
+                    "learning_rate": optimizer.param_groups[0]['lr']
+                })
+                
+                pbar.set_postfix({
+                    "loss": current_loss,
+                    "acc": current_acc
+                })
         
         # Calculate epoch metrics
-        train_loss = sum(train_loss) / len(train_loss)
-        train_acc = sum(train_accs) / len(train_accs)
+        epoch_loss = sum(train_loss) / len(train_loss)
+        epoch_acc = sum(train_accs) / len(train_accs)
         
-        # Log metrics to wandb
+        # Log epoch metrics
         wandb.log({
-            "train_loss": train_loss,
-            "train_acc": train_acc,
-            "learning_rate": optimizer.param_groups[0]['lr'],
-            "epoch": epoch + 1
+            "epoch": epoch + 1,
+            "epoch_loss": epoch_loss,
+            "epoch_acc": epoch_acc,
+            "learning_rate": optimizer.param_groups[0]['lr']
         })
         
-        # Print training info
-        print(f"[ Train | {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
-        
-        # ---------- Validation ----------
-        model.eval()
-        valid_loss = []
-        valid_accs = []
-        
-        # Progress bar for validation
-        valid_pbar = tqdm(valid_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Valid]")
-        
-        with torch.no_grad():
-            for batch in valid_pbar:
-                imgs, labels = batch
-                logits = model(imgs.to(device))
-                loss = criterion(logits, labels.to(device))
-                acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
-                
-                # Record metrics
-                valid_loss.append(loss.item())
-                valid_accs.append(acc.item())
-                
-                # Update progress bar
-                valid_pbar.set_postfix(
-                    {"loss": sum(valid_loss) / len(valid_loss), "acc": sum(valid_accs) / len(valid_accs)}
-                )
-        
-        # Calculate epoch metrics
-        valid_loss = sum(valid_loss) / len(valid_loss)
-        valid_acc = sum(valid_accs) / len(valid_accs)
-        
-        # Log metrics to wandb
-        wandb.log({
-            "valid_loss": valid_loss,
-            "valid_acc": valid_acc,
-            "epoch": epoch + 1
-        })
-        
-        # Print validation info
-        print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
+        print(f"[ Epoch {epoch + 1:03d}/{n_epochs:03d} ] loss = {epoch_loss:.5f}, acc = {epoch_acc:.5f}")
         
         # Update learning rate
         scheduler.step()
         
-        # Check for improvement
-        if valid_acc > best_acc:
+        # Save best model
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
             print(f"Best model found at epoch {epoch + 1}, saving model")
-            best_acc = valid_acc
-            stale = 0
             
-            # Save checkpoint
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'best_acc': best_acc,
+                'best_loss': best_loss,
             }, f"{_exp_name}_best.ckpt")
             
-            # Log best model to wandb
-            wandb.run.summary["best_accuracy"] = best_acc
+            wandb.run.summary["best_loss"] = best_loss
             wandb.run.summary["best_epoch"] = epoch + 1
-            
-        else:
-            stale += 1
-            print(f"No improvement in validation accuracy for {stale} epochs")
-            if stale >= patience:
-                print(f"Early stopping after {patience} epochs without improvement")
-                break
     
-    # Finish wandb run
     wandb.finish()
     
     # Test prediction
