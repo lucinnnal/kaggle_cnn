@@ -12,14 +12,13 @@ from torchvision.datasets import DatasetFolder, VisionDataset
 from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
 import wandb
 from utils import calculate_class_weights
-from torchvision.transforms import RandAugment
 
 # This is for the progress bar.
 from tqdm.auto import tqdm
 import random
 
 # Set experiment name and wandb project
-_exp_name = "ResNet34_Food_Classification + TTA + AutoAugment"
+_exp_name = "food_classification_improved"
 project_name = "food_classification"
 
 # Set a random seed for reproducibility
@@ -34,17 +33,15 @@ if torch.cuda.is_available():
 
 # Enhanced data transformations
 train_tfm = transforms.Compose([
-    transforms.Resize((144, 144)),  # Resize larger for RandomCrop
-    transforms.RandomCrop(128),     # Random crop to final size
+    transforms.Resize((224, 224)),
     transforms.RandomHorizontalFlip(p=0.5),
-    RandAugment(num_ops=2, magnitude=9),  # RandAugment
+    RandAugment(num_ops=2, magnitude=9),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
-# Test/validation transformations
 test_tfm = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -162,128 +159,92 @@ class ResNet18(nn.Module):
         
         return x
 
-class ResNet34(nn.Module):
-    def __init__(self, num_classes=11):
-        super(ResNet34, self).__init__()
-        self.in_planes = 64
+class LayerNorm(nn.Module):
+    def __init__(self, normalized_shape, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.normalized_shape = (normalized_shape, )
+    
+    def forward(self, x):
+        u = x.mean(1, keepdim=True)
+        s = (x - u).pow(2).mean(1, keepdim=True)
+        x = (x - u) / torch.sqrt(s + self.eps)
+        return self.weight[:, None, None] * x + self.bias[:, None, None]
 
-        # Initial convolution layer for 128x128 input
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),  # [64, 64, 64]
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # [64, 32, 32]
-        )
-
-        # ResNet34 stages with BasicBlock - [3,4,6,3] configuration
-        self.layer1 = self._make_layer(BasicBlock, 64, 3, stride=1)    # [64, 32, 32]
-        self.layer2 = self._make_layer(BasicBlock, 128, 4, stride=2)   # [128, 16, 16]
-        self.layer3 = self._make_layer(BasicBlock, 256, 6, stride=2)   # [256, 8, 8]
-        self.layer4 = self._make_layer(BasicBlock, 512, 3, stride=2)   # [512, 4, 4]
-
-        # Global average pooling and classifier
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Sequential(
-            nn.Dropout(0.5),
-            nn.Linear(512 * BasicBlock.expansion, num_classes)
-        )
-
-        self._initialize_weights()
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
+class Block(nn.Module):
+    def __init__(self, dim, drop_path=0.):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim)
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
-        x = self.conv1(x)      # [B, 64, 32, 32]
-        
-        x = self.layer1(x)     # [B, 64, 32, 32]
-        x = self.layer2(x)     # [B, 128, 16, 16]
-        x = self.layer3(x)     # [B, 256, 8, 8]
-        x = self.layer4(x)     # [B, 512, 4, 4]
-        
-        x = self.avgpool(x)    # [B, 512, 1, 1]
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
-        
+        input = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        x = x.permute(0, 3, 1, 2)
+        x = input + self.drop_path(x)
         return x
 
-def rand_bbox(size, lam):
-    W = size[2]
-    H = size[3]
-    cut_rat = np.sqrt(1. - lam)
-    cut_w = np.int32(W * cut_rat)
-    cut_h = np.int32(H * cut_rat)
-
-    cx = np.random.randint(W)
-    cy = np.random.randint(H)
-
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
-
-    return bbx1, bby1, bbx2, bby2
-
-def cutmix_data(x, y, alpha=1.0):
-    lam = np.random.beta(alpha, alpha)
-    rand_index = torch.randperm(x.size()[0]).to(x.device)
-    
-    bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
-    x[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
-    
-    # adjust lambda to exactly match pixel ratio
-    lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
-    y_a, y_b = y, y[rand_index]
-    
-    return x, y_a, y_b, lam
-
-def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch):
-    model.train()
-    train_loss = []
-    train_accs = []
-    
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}")
-    
-    for step, (imgs, labels) in enumerate(pbar):
-        imgs, labels = imgs.to(device), labels.to(device)
+class ConvNeXt(nn.Module):
+    def __init__(self, num_classes=11, depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0.):
+        super().__init__()
+        self.downsample_layers = nn.ModuleList()
+        stem = nn.Sequential(
+            nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
+            LayerNorm(dims[0], eps=1e-6)
+        )
+        self.downsample_layers.append(stem)
         
-        # Apply CutMix with 50% probability
-        if np.random.random() > 0.5:
-            imgs, labels_a, labels_b, lam = cutmix_data(imgs, labels)
-            outputs = model(imgs)
-            loss = criterion(outputs, labels_a) * lam + criterion(outputs, labels_b) * (1. - lam)
-        else:
-            outputs = model(imgs)
-            loss = criterion(outputs, labels)
+        for i in range(3):
+            downsample_layer = nn.Sequential(
+                LayerNorm(dims[i], eps=1e-6),
+                nn.Conv2d(dims[i], dims[i+1], kernel_size=2, stride=2)
+            )
+            self.downsample_layers.append(downsample_layer)
+
+        self.stages = nn.ModuleList()
+        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        cur = 0
         
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        for i in range(4):
+            stage = nn.Sequential(
+                *[Block(dim=dims[i], drop_path=dp_rates[cur + j]) 
+                  for j in range(depths[i])]
+            )
+            self.stages.append(stage)
+            cur += depths[i]
+
+        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+        self.head = nn.Linear(dims[-1], num_classes)
         
-        # Calculate accuracy for original labels only
-        acc = (outputs.argmax(dim=-1) == labels).float().mean()
-        train_loss.append(loss.item())
-        train_accs.append(acc.cpu().item())
-        
-        # ...rest of the training loop...
+        self.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+
+    def forward_features(self, x):
+        for i in range(4):
+            x = self.downsample_layers[i](x)
+            x = self.stages[i](x)
+        return self.norm(x.mean([-2, -1]))
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x
 
 def main():
     # Initialize wandb
@@ -294,88 +255,88 @@ def main():
         "model": "ResNet18",
         "optimizer": "AdamW",
         "scheduler": "MultiStepLR",
-        "scheduler_milestones": [60, 120, 160],
-        "scheduler_gamma": 0.1,
+        "scheduler_milestones": [60, 120, 160],  # Milestones for lr decay
+        "scheduler_gamma": 0.1,  # Learning rate decay factor
         "weight_decay": 1e-5,
-        "label_smoothing": 0.1,
-        "training_mode": "combined_train_valid",  # 새로운 설정 추가
-        "augmentation": {
-            "random_crop": "144->128",
-            "randaugment": {
-                "num_ops": 2,
-                "magnitude": 9
-            },
-            "cutmix": {
-                "prob": 0.5,
-                "beta": 1.0
-            }
-        }
+        "label_smoothing": 0.1
     })
     
     # Hyperparameters
     batch_size = 64
     n_epochs = 200
+    patience = 20  # Number of epochs to wait for improvement
     
     # Dataset directory
     _dataset_dir = "/content/data/"
     
-    # Calculate class weights using combined dataset
+    # Calculate class weights from training set
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Combine train and validation datasets
-    train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
-    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=train_tfm)  # validation도 train transform 사용
-    combined_dataset = ConcatDataset([train_set, valid_set])
-    
-    # Calculate class weights from combined dataset
     class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
     
-    # Create combined dataloader
-    combined_loader = DataLoader(
-        combined_dataset, 
-        batch_size=batch_size, 
-        shuffle=True,
-        num_workers=4,
-        pin_memory=True
-    )
+    # Construct datasets
+    train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True)
+    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False)
     
-    # Initialize model
-    model = ResNet34(num_classes=11).to(device)
+    # Device configuration
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+    
+    # Initialize model - Tiny version configuration
+    model = ConvNeXt(
+        num_classes=11,
+        depths=[3, 3, 9, 3],
+        dims=[96, 192, 384, 768],
+        drop_path_rate=0.1
+    ).to(device)
+    
+    # Initialize wandb to watch the model
     wandb.watch(model, log="all")
     
-    # Loss function
+    # Loss function (with label smoothing for better generalization)
     criterion = nn.CrossEntropyLoss(
         weight=class_weights,
         label_smoothing=0.1
     )
     
-    # Optimizer and scheduler
+    # Update wandb config to include class weights information
+    wandb.config.update({
+        "class_weights_enabled": True,
+        "class_weights": class_weights.cpu().tolist()
+    })
+    
+    # Optimizer with weight decay for regularization
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0004, weight_decay=1e-5)
+    
+    # Change learning rate scheduler to MultiStepLR
     scheduler = MultiStepLR(
         optimizer,
-        milestones=[30, 50, 70, 90],
-        gamma=0.7
+        milestones=[30, 50, 70, 90],  # Decrease lr at epochs 60, 120, and 160
+        gamma=0.7  # Multiply lr by 0.1 at each milestone
     )
     
-    # Training loop
-    best_loss = float('inf')
-    _exp_name = "food_classification_improved_combined"
+    # Training tracking variables
+    stale = 0
+    best_acc = 0
     
+    # Training and validation loop
     for epoch in range(n_epochs):
+        # ---------- Training ----------
         model.train()
         train_loss = []
         train_accs = []
         
-        # Progress bar
-        pbar = tqdm(combined_loader, desc=f"Epoch {epoch+1}/{n_epochs}")
+        # Progress bar for training
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Train]")
         
-        for step, batch in enumerate(pbar):
+        for batch in train_pbar:
+            # Get data and labels
             imgs, labels = batch
-            imgs, labels = imgs.to(device), labels.to(device)
             
             # Forward pass
-            logits = model(imgs)
-            loss = criterion(logits, labels)
+            logits = model(imgs.to(device))
+            loss = criterion(logits, labels.to(device))
             
             # Backward and optimize
             optimizer.zero_grad()
@@ -383,62 +344,100 @@ def main():
             optimizer.step()
             
             # Calculate accuracy
-            acc = (logits.argmax(dim=-1) == labels).float().mean()
+            acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
             
             # Record metrics
             train_loss.append(loss.item())
             train_accs.append(acc.item())
             
-            # Log every 10 steps
-            if (step + 1) % 10 == 0:
-                current_loss = sum(train_loss[-10:]) / 10
-                current_acc = sum(train_accs[-10:]) / 10
-                
-                wandb.log({
-                    "step": epoch * len(combined_loader) + step,
-                    "step_loss": current_loss,
-                    "step_acc": current_acc,
-                    "learning_rate": optimizer.param_groups[0]['lr']
-                })
-                
-                pbar.set_postfix({
-                    "loss": current_loss,
-                    "acc": current_acc
-                })
+            # Update progress bar
+            train_pbar.set_postfix(
+                {"loss": sum(train_loss) / len(train_loss), "acc": sum(train_accs) / len(train_accs)}
+            )
         
         # Calculate epoch metrics
-        epoch_loss = sum(train_loss) / len(train_loss)
-        epoch_acc = sum(train_accs) / len(train_accs)
+        train_loss = sum(train_loss) / len(train_loss)
+        train_acc = sum(train_accs) / len(train_accs)
         
-        # Log epoch metrics
+        # Log metrics to wandb
         wandb.log({
-            "epoch": epoch + 1,
-            "epoch_loss": epoch_loss,
-            "epoch_acc": epoch_acc,
-            "learning_rate": optimizer.param_groups[0]['lr']
+            "train_loss": train_loss,
+            "train_acc": train_acc,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "epoch": epoch + 1
         })
         
-        print(f"[ Epoch {epoch + 1:03d}/{n_epochs:03d} ] loss = {epoch_loss:.5f}, acc = {epoch_acc:.5f}")
+        # Print training info
+        print(f"[ Train | {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
+        
+        # ---------- Validation ----------
+        model.eval()
+        valid_loss = []
+        valid_accs = []
+        
+        # Progress bar for validation
+        valid_pbar = tqdm(valid_loader, desc=f"Epoch {epoch+1}/{n_epochs} [Valid]")
+        
+        with torch.no_grad():
+            for batch in valid_pbar:
+                imgs, labels = batch
+                logits = model(imgs.to(device))
+                loss = criterion(logits, labels.to(device))
+                acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+                
+                # Record metrics
+                valid_loss.append(loss.item())
+                valid_accs.append(acc.item())
+                
+                # Update progress bar
+                valid_pbar.set_postfix(
+                    {"loss": sum(valid_loss) / len(valid_loss), "acc": sum(valid_accs) / len(valid_accs)}
+                )
+        
+        # Calculate epoch metrics
+        valid_loss = sum(valid_loss) / len(valid_loss)
+        valid_acc = sum(valid_accs) / len(valid_accs)
+        
+        # Log metrics to wandb
+        wandb.log({
+            "valid_loss": valid_loss,
+            "valid_acc": valid_acc,
+            "epoch": epoch + 1
+        })
+        
+        # Print validation info
+        print(f"[ Valid | {epoch + 1:03d}/{n_epochs:03d} ] loss = {valid_loss:.5f}, acc = {valid_acc:.5f}")
         
         # Update learning rate
         scheduler.step()
         
-        # Save best model
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
+        # Check for improvement
+        if valid_acc > best_acc:
             print(f"Best model found at epoch {epoch + 1}, saving model")
+            best_acc = valid_acc
+            stale = 0
             
+            # Save checkpoint
             torch.save({
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
-                'best_loss': best_loss,
+                'best_acc': best_acc,
             }, f"{_exp_name}_best.ckpt")
             
-            wandb.run.summary["best_loss"] = best_loss
+            # Log best model to wandb
+            wandb.run.summary["best_accuracy"] = best_acc
             wandb.run.summary["best_epoch"] = epoch + 1
+            
+        else:
+            stale += 1
+            print(f"No improvement in validation accuracy for {stale} epochs")
+            if stale >= patience:
+                print(f"Early stopping after {patience} epochs without improvement")
+                break
     
+    # Finish wandb run
     wandb.finish()
     
     # Test prediction
@@ -456,7 +455,12 @@ def test_prediction():
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     # Load best model
-    model_best = ResNet34(num_classes=11).to(device)
+    model_best = ConvNeXt(
+        num_classes=11,
+        depths=[3, 3, 9, 3],
+        dims=[96, 192, 384, 768],
+        drop_path_rate=0.1
+    ).to(device)
     checkpoint = torch.load(f"{_exp_name}_best.ckpt")
     model_best.load_state_dict(checkpoint['model_state_dict'])
     model_best.eval()
