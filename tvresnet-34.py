@@ -19,7 +19,7 @@ from tqdm.auto import tqdm
 import random
 
 # Set experiment name and wandb project
-_exp_name = "food_classification_improved"
+_exp_name = "ResNet34_Food_Classification + TTA + AutoAugment"
 project_name = "food_classification"
 
 # Set a random seed for reproducibility
@@ -32,11 +32,12 @@ random.seed(myseed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(myseed)
 
-# Enhanced data transformations with RandAugment and AutoAugment
+# Enhanced data transformations
 train_tfm = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((144, 144)),  # Resize larger for RandomCrop
+    transforms.RandomCrop(128),     # Random crop to final size
     transforms.RandomHorizontalFlip(p=0.5),
-    RandAugment(num_ops=2, magnitude=9),
+    RandAugment(num_ops=2, magnitude=9),  # RandAugment
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -47,27 +48,6 @@ test_tfm = transforms.Compose([
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-
-# TTA transforms
-tta_transforms = [
-    transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ]),
-    transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.RandomHorizontalFlip(p=1.0),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ]),
-    transforms.Compose([
-        transforms.Resize((128, 128)),
-        transforms.RandomRotation(15),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-    ])
-]
 
 
 class FoodDataset(Dataset):
@@ -187,19 +167,21 @@ class ResNet34(nn.Module):
         super(ResNet34, self).__init__()
         self.in_planes = 64
 
+        # Initial convolution layer for 128x128 input
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),  # [64, 64, 64]
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # [64, 32, 32]
         )
 
-        # ResNet34 configuration: [3,4,6,3]
-        self.layer1 = self._make_layer(BasicBlock, 64, 3, stride=1)
-        self.layer2 = self._make_layer(BasicBlock, 128, 4, stride=2)
-        self.layer3 = self._make_layer(BasicBlock, 256, 6, stride=2)
-        self.layer4 = self._make_layer(BasicBlock, 512, 3, stride=2)
+        # ResNet34 stages with BasicBlock - [3,4,6,3] configuration
+        self.layer1 = self._make_layer(BasicBlock, 64, 3, stride=1)    # [64, 32, 32]
+        self.layer2 = self._make_layer(BasicBlock, 128, 4, stride=2)   # [128, 16, 16]
+        self.layer3 = self._make_layer(BasicBlock, 256, 6, stride=2)   # [256, 8, 8]
+        self.layer4 = self._make_layer(BasicBlock, 512, 3, stride=2)   # [512, 4, 4]
 
+        # Global average pooling and classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Sequential(
             nn.Dropout(0.5),
@@ -215,6 +197,33 @@ class ResNet34(nn.Module):
             layers.append(block(self.in_planes, planes, stride))
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
+
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.conv1(x)      # [B, 64, 32, 32]
+        
+        x = self.layer1(x)     # [B, 64, 32, 32]
+        x = self.layer2(x)     # [B, 128, 16, 16]
+        x = self.layer3(x)     # [B, 256, 8, 8]
+        x = self.layer4(x)     # [B, 512, 4, 4]
+        
+        x = self.avgpool(x)    # [B, 512, 1, 1]
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+        
+        return x
 
 def rand_bbox(size, lam):
     W = size[2]
@@ -240,6 +249,7 @@ def cutmix_data(x, y, alpha=1.0):
     bbx1, bby1, bbx2, bby2 = rand_bbox(x.size(), lam)
     x[:, :, bbx1:bbx2, bby1:bby2] = x[rand_index, :, bbx1:bbx2, bby1:bby2]
     
+    # adjust lambda to exactly match pixel ratio
     lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (x.size()[-1] * x.size()[-2]))
     y_a, y_b = y, y[rand_index]
     
@@ -250,7 +260,7 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ep
     train_loss = []
     train_accs = []
     
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}")
     
     for step, (imgs, labels) in enumerate(pbar):
         imgs, labels = imgs.to(device), labels.to(device)
@@ -268,36 +278,38 @@ def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, ep
         loss.backward()
         optimizer.step()
         
+        # Calculate accuracy for original labels only
         acc = (outputs.argmax(dim=-1) == labels).float().mean()
         train_loss.append(loss.item())
         train_accs.append(acc.cpu().item())
         
-        if (step + 1) % 10 == 0:
-            current_loss = sum(train_loss[-10:]) / 10
-            current_acc = sum(train_accs[-10:]) / 10
-            wandb.log({
-                "train/step": epoch * len(train_loader) + step,
-                "train/step_loss": current_loss,
-                "train/step_acc": current_acc,
-                "train/learning_rate": optimizer.param_groups[0]['lr']
-            })
-            pbar.set_postfix({"loss": current_loss, "acc": current_acc})
-    
-    return np.mean(train_loss), np.mean(train_accs)
+        # ...rest of the training loop...
 
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
-        "model": "ResNet34",
-        "augmentation": "RandAugment + CutMix + TTA",
         "learning_rate": 0.0003,
-        "batch_size": 64,
         "epochs": 200,
+        "batch_size": 64,
+        "model": "ResNet18",
         "optimizer": "AdamW",
         "scheduler": "MultiStepLR",
-        "scheduler_milestones": [30, 50, 70, 90],
+        "scheduler_milestones": [60, 120, 160],
+        "scheduler_gamma": 0.1,
         "weight_decay": 1e-5,
-        "label_smoothing": 0.1
+        "label_smoothing": 0.1,
+        "training_mode": "combined_train_valid",  # 새로운 설정 추가
+        "augmentation": {
+            "random_crop": "144->128",
+            "randaugment": {
+                "num_ops": 2,
+                "magnitude": 9
+            },
+            "cutmix": {
+                "prob": 0.5,
+                "beta": 1.0
+            }
+        }
     })
     
     # Hyperparameters
@@ -350,24 +362,70 @@ def main():
     _exp_name = "food_classification_improved_combined"
     
     for epoch in range(n_epochs):
-        train_loss, train_acc = train_epoch(model, combined_loader, criterion, optimizer, scheduler, device, epoch)
+        model.train()
+        train_loss = []
+        train_accs = []
+        
+        # Progress bar
+        pbar = tqdm(combined_loader, desc=f"Epoch {epoch+1}/{n_epochs}")
+        
+        for step, batch in enumerate(pbar):
+            imgs, labels = batch
+            imgs, labels = imgs.to(device), labels.to(device)
+            
+            # Forward pass
+            logits = model(imgs)
+            loss = criterion(logits, labels)
+            
+            # Backward and optimize
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            
+            # Calculate accuracy
+            acc = (logits.argmax(dim=-1) == labels).float().mean()
+            
+            # Record metrics
+            train_loss.append(loss.item())
+            train_accs.append(acc.item())
+            
+            # Log every 10 steps
+            if (step + 1) % 10 == 0:
+                current_loss = sum(train_loss[-10:]) / 10
+                current_acc = sum(train_accs[-10:]) / 10
+                
+                wandb.log({
+                    "step": epoch * len(combined_loader) + step,
+                    "step_loss": current_loss,
+                    "step_acc": current_acc,
+                    "learning_rate": optimizer.param_groups[0]['lr']
+                })
+                
+                pbar.set_postfix({
+                    "loss": current_loss,
+                    "acc": current_acc
+                })
+        
+        # Calculate epoch metrics
+        epoch_loss = sum(train_loss) / len(train_loss)
+        epoch_acc = sum(train_accs) / len(train_accs)
         
         # Log epoch metrics
         wandb.log({
             "epoch": epoch + 1,
-            "epoch_loss": train_loss,
-            "epoch_acc": train_acc,
+            "epoch_loss": epoch_loss,
+            "epoch_acc": epoch_acc,
             "learning_rate": optimizer.param_groups[0]['lr']
         })
         
-        print(f"[ Epoch {epoch + 1:03d}/{n_epochs:03d} ] loss = {train_loss:.5f}, acc = {train_acc:.5f}")
+        print(f"[ Epoch {epoch + 1:03d}/{n_epochs:03d} ] loss = {epoch_loss:.5f}, acc = {epoch_acc:.5f}")
         
         # Update learning rate
         scheduler.step()
         
         # Save best model
-        if train_loss < best_loss:
-            best_loss = train_loss
+        if epoch_loss < best_loss:
+            best_loss = epoch_loss
             print(f"Best model found at epoch {epoch + 1}, saving model")
             
             torch.save({
@@ -388,34 +446,36 @@ def main():
     
 
 def test_prediction():
+    _dataset_dir = "/content/data/"
+    _exp_name = "food_classification_improved"
+    batch_size = 64
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Load test dataset
     test_set = FoodDataset(os.path.join(_dataset_dir, "test"), tfm=test_tfm, is_test=True)
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
+    # Load best model
     model_best = ResNet34(num_classes=11).to(device)
     checkpoint = torch.load(f"{_exp_name}_best.ckpt")
     model_best.load_state_dict(checkpoint['model_state_dict'])
     model_best.eval()
     
-    predictions = []
+    # Prediction with tqdm progress bar
+    prediction = []
     file_ids = []
     
     with torch.no_grad():
         for data, _, file_id in tqdm(test_loader, desc="Generating predictions"):
-            batch_predictions = []
-            
-            # Apply TTA
-            for transform in tta_transforms:
-                augmented_data = torch.stack([transform(img) for img in data]).to(device)
-                pred = model_best(augmented_data)
-                batch_predictions.append(pred.softmax(dim=1))
-            
-            # Average predictions
-            final_pred = torch.stack(batch_predictions).mean(0)
-            predictions.extend(final_pred.argmax(dim=1).cpu().numpy())
-            file_ids.extend(file_id)
+            test_pred = model_best(data.to(device))
+            test_label = np.argmax(test_pred.cpu().data.numpy(), axis=1)
+            prediction += test_label.squeeze().tolist()
+            file_ids += file_id  # Append original IDs
     
-    df = pd.DataFrame({"ID": file_ids, "Category": predictions})
+    # Create submission CSV
+    df = pd.DataFrame()
+    df["ID"] = file_ids
+    df["Category"] = prediction
     df.to_csv("submission.csv", index=False)
     print("Submission file created successfully!")
 
