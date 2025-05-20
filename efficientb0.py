@@ -33,8 +33,8 @@ if torch.cuda.is_available():
 
 # Enhanced data transformations for training with various augmentations
 train_tfm = transforms.Compose([
-    # Resize the image into a fixed shape
-    transforms.Resize((128, 128)),
+    # Resize the image into a fixed shape (224x224)
+    transforms.Resize((224, 224)),
     # Random horizontal flip
     transforms.RandomHorizontalFlip(p=0.5),
     # Rotation
@@ -45,12 +45,11 @@ train_tfm = transforms.Compose([
     transforms.ToTensor(),
     # Normalize the image
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-
 ])
 
 # Test/validation transformations
 test_tfm = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
