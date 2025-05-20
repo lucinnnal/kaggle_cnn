@@ -335,7 +335,7 @@ def test_prediction():
     
     # Prediction with tqdm progress bar
     prediction = []
-    file_ids = []
+    file_ids = []3
     
     with torch.no_grad():
         for data, _, file_id in tqdm(test_loader, desc="Generating predictions"):
