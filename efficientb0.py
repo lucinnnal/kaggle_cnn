@@ -149,32 +149,43 @@ class EfficientNetB0(nn.Module):
         
         # Initial conv
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1, bias=False),
+            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1, bias=False),
             nn.BatchNorm2d(32),
             Swish()
         )
         
-        # MBConv blocks
+        # MBConv blocks with correct channel configurations
         self.blocks = nn.Sequential(
-            # MBConv1, 112x112
-            MBConvBlock(32, 16, 3, 1, 1),
-            # MBConv6, 112x112
-            *[MBConvBlock(16, 24, 3, 2, 6) for _ in range(2)],
-            # MBConv6, 56x56
-            *[MBConvBlock(24, 40, 5, 2, 6) for _ in range(2)],
-            # MBConv6, 28x28
-            *[MBConvBlock(40, 80, 3, 2, 6) for _ in range(3)],
-            # MBConv6, 14x14
-            *[MBConvBlock(80, 112, 5, 1, 6) for _ in range(3)],
-            # MBConv6, 14x14
-            *[MBConvBlock(112, 192, 5, 2, 6) for _ in range(4)],
-            # MBConv6, 7x7
-            *[MBConvBlock(192, 320, 3, 1, 6) for _ in range(1)]
+            # Stage 1: 112x112
+            MBConvBlock(32, 16, 3, 1, 1),  # MBConv1
+            
+            # Stage 2: 112x112 -> 56x56
+            *[MBConvBlock(16 if i == 0 else 24, 24, 3, 2 if i == 0 else 1, 6)
+              for i in range(2)],
+            
+            # Stage 3: 56x56 -> 28x28
+            *[MBConvBlock(24 if i == 0 else 40, 40, 5, 2 if i == 0 else 1, 6)
+              for i in range(2)],
+            
+            # Stage 4: 28x28 -> 14x14
+            *[MBConvBlock(40 if i == 0 else 80, 80, 3, 2 if i == 0 else 1, 6)
+              for i in range(3)],
+            
+            # Stage 5: 14x14
+            *[MBConvBlock(80 if i == 0 else 112, 112, 5, 1, 6)
+              for i in range(3)],
+            
+            # Stage 6: 14x14 -> 7x7
+            *[MBConvBlock(112 if i == 0 else 192, 192, 5, 2 if i == 0 else 1, 6)
+              for i in range(4)],
+            
+            # Stage 7: 7x7
+            MBConvBlock(192, 320, 3, 1, 6)
         )
         
         # Final conv
         self.conv2 = nn.Sequential(
-            nn.Conv2d(320, 1280, 1, bias=False),
+            nn.Conv2d(320, 1280, kernel_size=1, bias=False),
             nn.BatchNorm2d(1280),
             Swish()
         )
