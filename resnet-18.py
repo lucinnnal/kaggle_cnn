@@ -234,10 +234,10 @@ def main():
         "pseudo_threshold": 0.9,  # Confidence threshold for pseudo labeling
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingWarmRestarts",
-        "scheduler_T0": 50,
+        "scheduler_T0": 100,
         "scheduler_T_mult": 1,
         "scheduler_eta_min": 1e-7,
-        "weight_decay": 1e-5,
+        "weight_decay": 1e-4,
         "label_smoothing": 0.1
     })
     
@@ -290,8 +290,8 @@ def main():
         # Initialize model, criterion, optimizer, scheduler
         model = ResNet18(num_classes=11).to(device)
         criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=1, eta_min=1e-7)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=1, eta_min=1e-7)
         
         best_acc = 0
         best_state = None
@@ -366,8 +366,8 @@ def main():
     # Initialize final model
     final_model = ResNet18(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(final_model.parameters(), lr=0.0005, weight_decay=1e-5)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=1, eta_min=1e-7)
+    optimizer = torch.optim.AdamW(final_model.parameters(), lr=0.0005, weight_decay=1e-4)
+    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=50, T_mult=1, eta_min=1e-7)
     
     best_acc_final = 0
     stale = 0
