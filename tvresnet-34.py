@@ -31,17 +31,26 @@ random.seed(myseed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(myseed)
 
-# Enhanced data transformations
+# Enhanced data transformations for training with various augmentations
 train_tfm = transforms.Compose([
-    transforms.Resize((224, 224)),
+    # Resize the image into a fixed shape
+    transforms.Resize((128, 128)),
+    # Random horizontal flip
     transforms.RandomHorizontalFlip(p=0.5),
-    RandAugment(num_ops=2, magnitude=9),
+    # Rotation
+    transforms.RandomRotation(30),
+    # Color Jitter
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    # Convert to tensor
     transforms.ToTensor(),
+    # Normalize the image
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+
 ])
 
+# Test/validation transformations
 test_tfm = transforms.Compose([
-    transforms.Resize((224, 224)),
+    transforms.Resize((128, 128)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
@@ -159,93 +168,6 @@ class ResNet18(nn.Module):
         
         return x
 
-class LayerNorm(nn.Module):
-    def __init__(self, normalized_shape, eps=1e-6):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        self.eps = eps
-        self.normalized_shape = (normalized_shape, )
-    
-    def forward(self, x):
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        return self.weight[:, None, None] * x + self.bias[:, None, None]
-
-class Block(nn.Module):
-    def __init__(self, dim, drop_path=0.):
-        super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm = LayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, 4 * dim)
-        self.act = nn.GELU()
-        self.pwconv2 = nn.Linear(4 * dim, dim)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-    def forward(self, x):
-        input = x
-        x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        x = x.permute(0, 3, 1, 2)
-        x = input + self.drop_path(x)
-        return x
-
-class ConvNeXt(nn.Module):
-    def __init__(self, num_classes=11, depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0.):
-        super().__init__()
-        self.downsample_layers = nn.ModuleList()
-        stem = nn.Sequential(
-            nn.Conv2d(3, dims[0], kernel_size=4, stride=4),
-            LayerNorm(dims[0], eps=1e-6)
-        )
-        self.downsample_layers.append(stem)
-        
-        for i in range(3):
-            downsample_layer = nn.Sequential(
-                LayerNorm(dims[i], eps=1e-6),
-                nn.Conv2d(dims[i], dims[i+1], kernel_size=2, stride=2)
-            )
-            self.downsample_layers.append(downsample_layer)
-
-        self.stages = nn.ModuleList()
-        dp_rates = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
-        cur = 0
-        
-        for i in range(4):
-            stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j]) 
-                  for j in range(depths[i])]
-            )
-            self.stages.append(stage)
-            cur += depths[i]
-
-        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
-        self.head = nn.Linear(dims[-1], num_classes)
-        
-        self.apply(self._init_weights)
-
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-
-    def forward_features(self, x):
-        for i in range(4):
-            x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
-        return self.norm(x.mean([-2, -1]))
-
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
-        return x
-
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
@@ -283,13 +205,8 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
     
-    # Initialize model - Tiny version configuration
-    model = ConvNeXt(
-        num_classes=11,
-        depths=[3, 3, 9, 3],
-        dims=[96, 192, 384, 768],
-        drop_path_rate=0.1
-    ).to(device)
+    # Initialize model
+    model = ResNet18(num_classes=11).to(device)
     
     # Initialize wandb to watch the model
     wandb.watch(model, log="all")
@@ -455,12 +372,7 @@ def test_prediction():
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     # Load best model
-    model_best = ConvNeXt(
-        num_classes=11,
-        depths=[3, 3, 9, 3],
-        dims=[96, 192, 384, 768],
-        drop_path_rate=0.1
-    ).to(device)
+    model_best = ResNet18(num_classes=11).to(device)
     checkpoint = torch.load(f"{_exp_name}_best.ckpt")
     model_best.load_state_dict(checkpoint['model_state_dict'])
     model_best.eval()
