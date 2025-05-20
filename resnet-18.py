@@ -244,7 +244,7 @@ def main():
     # Hyperparameters
     batch_size = 64
     n_epochs = 100
-    patience = 15
+    patience = 20
     device = "cuda" if torch.cuda.is_available() else "cpu"
     n_folds = 5
     pseudo_threshold = 0.9
