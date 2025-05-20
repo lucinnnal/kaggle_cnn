@@ -265,9 +265,9 @@ def main():
     # Phase 1: Initial scheduler
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=30,           # First restart at epoch 20
-        T_mult=1,         # Keep same cycle length
-        eta_min=1e-7,     # Minimum learning rate
+        T_0=10,           # First restart at epoch 20
+        T_mult=2,         # Keep same cycle length
+        eta_min=1e-5,     # Minimum learning rate
         last_epoch=-1
     )
     
@@ -304,14 +304,6 @@ def main():
         if valid_acc > best_acc:
             best_acc = valid_acc
             best_state = model.state_dict().copy()
-            # Save checkpoint for phase 1
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'epoch': epoch + 1,
-                'best_acc': best_acc,
-            }, f"{_exp_name}_phase1_best.ckpt")
             print(f"Best model saved at epoch {epoch+1} with accuracy: {best_acc:.4f}")
             stale = 0
         else:
@@ -336,9 +328,9 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=30,           # First restart at epoch 20
+        T_0=20,           # Shorter cycle for phase 2
         T_mult=1,         # Keep same cycle length
-        eta_min=1e-7,     # Minimum learning rate
+        eta_min=1e-5,     # Minimum learning rate
         last_epoch=-1
     )
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)  # Use same weights
@@ -383,35 +375,35 @@ def test_prediction():
     _dataset_dir = "/content/data/"
     batch_size = 64
     
-    # Load test dataset
+    # Define TTA transforms
+    tta_transforms = [
+        transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomHorizontalFlip(p=1.0),  # Always flip
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([
+            transforms.Resize((248, 248)),  # Larger size
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        transforms.Compose([
+            transforms.Resize((224, 224)),
+            transforms.RandomRotation(90),  # 90 degree rotation
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    ]
+    
+    # Load test dataset and model
     test_set = FoodDataset(os.path.join(_dataset_dir, "test"), tfm=test_tfm, is_test=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    
-    # Load final model
-    model = ResNet18(num_classes=11).to(device)
-    checkpoint = torch.load(f"{_exp_name}_final.ckpt")
-    model.load_state_dict(checkpoint['model_state_dict'])
-    model.eval()
-    
-    # Generate predictions
-    predictions = []
-    file_ids = []
-    
-    with torch.no_grad():
-        for data, _, file_id in tqdm(test_loader, desc="Generating predictions"):
-            outputs = model(data.to(device))
-            preds = outputs.argmax(dim=1).cpu().numpy()
-            predictions.extend(preds)
-            file_ids.extend(file_id)
-    
-    # Create submission file
-    df = pd.DataFrame({
-        "ID": file_ids,
-        "Category": predictions
-    })
-    df.to_csv("submission.csv", index=False)
-    print("Submission file created successfully!")
-
 
 if __name__ == "__main__":
     main()
