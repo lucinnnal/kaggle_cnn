@@ -9,10 +9,9 @@ from PIL import Image
 # "ConcatDataset" and "Subset" are possibly useful when doing semi-supervised learning.
 from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
 from torchvision.datasets import DatasetFolder, VisionDataset
-from torch.optim.lr_scheduler import CosineAnnealingLR, MultiStepLR
+from torch.optim.lr_scheduler import CosineAnnealingLR, CosineAnnealingWarmRestarts
 import wandb
 from utils import calculate_class_weights
-from sklearn.model_selection import StratifiedKFold
 
 # This is for the progress bar.
 from tqdm.auto import tqdm
@@ -34,8 +33,8 @@ if torch.cuda.is_available():
 
 # Enhanced data transformations for training with various augmentations
 train_tfm = transforms.Compose([
-    # Resize the image into a fixed shape
-    transforms.Resize((128, 128)),
+    # Resize the image into a fixed shape (224x224)
+    transforms.Resize((224, 224)),
     # Random horizontal flip
     transforms.RandomHorizontalFlip(p=0.5),
     # Rotation
@@ -46,16 +45,14 @@ train_tfm = transforms.Compose([
     transforms.ToTensor(),
     # Normalize the image
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-
 ])
 
 # Test/validation transformations
 test_tfm = transforms.Compose([
-    transforms.Resize((128, 128)),
+    transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
-
 
 class FoodDataset(Dataset):
     def __init__(self, path, tfm=test_tfm, files=None, is_test=False):
@@ -91,7 +88,7 @@ class BasicBlock(nn.Module):
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-        
+
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != self.expansion*planes:
             self.shortcut = nn.Sequential(
@@ -100,38 +97,39 @@ class BasicBlock(nn.Module):
             )
 
     def forward(self, x):
-        out = torch.relu(self.bn1(self.conv1(x)))
+        out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
         out += self.shortcut(x)
-        out = torch.relu(out)
+        out = F.relu(out)
         return out
 
 class ResNet18(nn.Module):
     def __init__(self, num_classes=11):
         super(ResNet18, self).__init__()
-        self.in_planes = 32  # 채널 수를 줄임
+        self.in_planes = 64
 
-        # Initial convolution layer for 128x128 input
+        # Initial convolution layer for 224x224 input
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=1, padding=1, bias=False),  # [32, 128, 128]
-            nn.BatchNorm2d(32),
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),  # 112x112
+            nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # [32, 64, 64]
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 56x56
         )
 
-        # ResNet stages with BasicBlock - [2,2,2,2] configuration
-        self.layer1 = self._make_layer(BasicBlock, 32, 2, stride=1)    # [32, 64, 64]
-        self.layer2 = self._make_layer(BasicBlock, 64, 2, stride=2)    # [64, 32, 32]
-        self.layer3 = self._make_layer(BasicBlock, 128, 2, stride=2)   # [128, 16, 16]
-        self.layer4 = self._make_layer(BasicBlock, 256, 2, stride=2)   # [256, 8, 8]
+        # ResNet stages
+        self.layer1 = self._make_layer(BasicBlock, 64, 2, stride=1)   # 56x56
+        self.layer2 = self._make_layer(BasicBlock, 128, 2, stride=2)  # 28x28
+        self.layer3 = self._make_layer(BasicBlock, 256, 2, stride=2)  # 14x14
+        self.layer4 = self._make_layer(BasicBlock, 512, 2, stride=2)  # 7x7
 
         # Global average pooling and classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Sequential(
             nn.Dropout(0.4),
-            nn.Linear(256 * BasicBlock.expansion, num_classes)
+            nn.Linear(512 * BasicBlock.expansion, num_classes)
         )
 
+        # Initialize weights
         self._initialize_weights()
 
     def _make_layer(self, block, planes, num_blocks, stride):
@@ -146,8 +144,6 @@ class ResNet18(nn.Module):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
@@ -156,256 +152,257 @@ class ResNet18(nn.Module):
                 nn.init.constant_(m.bias, 0)
 
     def forward(self, x):
-        x = self.conv1(x)      # [B, 32, 64, 64]
+        x = self.conv1(x)      # [B, 64, 56, 56]
+        x = self.layer1(x)     # [B, 64, 56, 56]
+        x = self.layer2(x)     # [B, 128, 28, 28]
+        x = self.layer3(x)     # [B, 256, 14, 14]
+        x = self.layer4(x)     # [B, 512, 7, 7]
         
-        x = self.layer1(x)     # [B, 32, 64, 64]
-        x = self.layer2(x)     # [B, 64, 32, 32]
-        x = self.layer3(x)     # [B, 128, 16, 16]
-        x = self.layer4(x)     # [B, 256, 8, 8]
-        
-        x = self.avgpool(x)    # [B, 256, 1, 1]
+        x = self.avgpool(x)    # [B, 512, 1, 1]
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         
         return x
-
-def main():
-    # Initialize wandb
-    wandb.init(project=project_name, name=_exp_name, config={
-        "learning_rate": 0.0003,
-        "epochs": 200,
-        "batch_size": 64,
-        "model": "ResNet18",
-        "optimizer": "AdamW",
-        "scheduler": "MultiStepLR",
-        "scheduler_milestones": [30, 50, 70, 90],
-        "scheduler_gamma": 0.7,
-        "weight_decay": 1e-5,
-        "label_smoothing": 0.1,
-        "n_folds": 5,
-        "pseudo_threshold": 0.9  # Confidence threshold for pseudo labeling
-    })
-    
-    # Hyperparameters
-    batch_size = 64
-    n_epochs = 200
-    n_folds = 5
-    patience = 20
-    pseudo_threshold = 0.9
-    
-    # Dataset directory
-    _dataset_dir = "/content/data/"
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    
-    # Load all data
-    train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
-    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=train_tfm)
-    test_set = FoodDataset(os.path.join(_dataset_dir, "test"), tfm=test_tfm, is_test=True)
-    
-    # Combine train and validation sets
-    all_data = ConcatDataset([train_set, valid_set])
-    
-    # Prepare labels for stratification
-    all_labels = []
-    for dataset in [train_set, valid_set]:
-        all_labels.extend([dataset.files[i].split("/")[-1].split("_")[0] for i in range(len(dataset))])
-    all_labels = np.array(all_labels, dtype=int)
-    
-    # Initialize fold predictions for test set
-    test_predictions = []
-    
-    # 5-fold cross validation
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=myseed)
-    
-    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(all_labels)), all_labels)):
-        print(f"\nFold {fold + 1}")
-        
-        # Create fold datasets
-        train_fold = Subset(all_data, train_idx)
-        val_fold = Subset(all_data, val_idx)
-        
-        train_loader = DataLoader(train_fold, batch_size=batch_size, shuffle=True, num_workers=4)
-        valid_loader = DataLoader(val_fold, batch_size=batch_size, shuffle=False, num_workers=4)
-        test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4)
-        
-        # Initialize model, criterion, optimizer
-        model = ResNet18(num_classes=11).to(device)
-        class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0004, weight_decay=1e-5)
-        scheduler = MultiStepLR(optimizer, milestones=[30, 50, 70, 90], gamma=0.7)
-        
-        # Training tracking variables
-        best_acc = 0
-        stale = 0
-        
-        # Training loop
-        for epoch in range(n_epochs):
-            # Training
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch)
-            
-            # Validation
-            valid_loss, valid_acc = valid_epoch(model, valid_loader, criterion, device)
-            
-            # Logging
-            wandb.log({
-                f"fold_{fold+1}/train_loss": train_loss,
-                f"fold_{fold+1}/train_acc": train_acc,
-                f"fold_{fold+1}/valid_loss": valid_loss,
-                f"fold_{fold+1}/valid_acc": valid_acc,
-                "epoch": epoch + 1
-            })
-            
-            # Save best model
-            if valid_acc > best_acc:
-                best_acc = valid_acc
-                stale = 0
-                torch.save({
-                    'fold': fold + 1,
-                    'epoch': epoch + 1,
-                    'model_state_dict': model.state_dict(),
-                    'best_acc': best_acc,
-                }, f"{_exp_name}_fold{fold+1}_best.ckpt")
-            else:
-                stale += 1
-                if stale >= patience:
-                    break
-        
-        # Generate predictions for test set
-        model.eval()
-        fold_predictions = []
-        fold_probabilities = []
-        
-        with torch.no_grad():
-            for data, _, _ in test_loader:
-                outputs = model(data.to(device))
-                probs = torch.softmax(outputs, dim=1)
-                fold_probabilities.append(probs.cpu())
-                
-        fold_probabilities = torch.cat(fold_probabilities)
-        test_predictions.append(fold_probabilities)
-    
-    # Average predictions from all folds
-    ensemble_probs = torch.stack(test_predictions).mean(0)
-    ensemble_preds = ensemble_probs.argmax(1)
-    
-    # Generate pseudo labels for high confidence predictions
-    pseudo_mask = ensemble_probs.max(1)[0] >= pseudo_threshold
-    pseudo_labels = ensemble_preds[pseudo_mask]
-    pseudo_data = Subset(test_set, pseudo_mask.nonzero().squeeze())
-    
-    # Train final model with pseudo labels
-    print("\nTraining final model with pseudo labels...")
-    
-    # Combine all data with pseudo labeled data
-    final_train_data = ConcatDataset([all_data, pseudo_data])
-    final_train_loader = DataLoader(final_train_data, batch_size=batch_size, shuffle=True, num_workers=4)
-    
-    # Train final model
-    final_model = ResNet18(num_classes=11).to(device)
-    final_criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    final_optimizer = torch.optim.AdamW(final_model.parameters(), lr=0.0004, weight_decay=1e-5)
-    final_scheduler = MultiStepLR(final_optimizer, milestones=[30, 50, 70, 90], gamma=0.7)
-    
-    # Final training loop
-    for epoch in range(n_epochs):
-        train_loss, train_acc = train_epoch(final_model, final_train_loader, final_criterion, 
-                                          final_optimizer, final_scheduler, device, epoch)
-        
-        wandb.log({
-            "final_model/train_loss": train_loss,
-            "final_model/train_acc": train_acc,
-            "epoch": epoch + 1
-        })
-    
-    # Save final model
-    torch.save({
-        'epoch': epoch + 1,
-        'model_state_dict': final_model.state_dict(),
-        'final_acc': train_acc,
-    }, f"{_exp_name}_final.ckpt")
-    
-    # Generate final predictions
-    final_predictions = generate_predictions(final_model, test_loader, device)
-    
-    # Create submission CSV
-    create_submission(final_predictions, test_set.files)
-    
-    wandb.finish()
 
 def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch):
     model.train()
     train_loss = []
     train_accs = []
     
-    train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1} [Train]")
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}")
     
-    for batch in train_pbar:
+    for step, batch in enumerate(pbar):
         imgs, labels = batch
-        logits = model(imgs.to(device))
-        loss = criterion(logits, labels.to(device))
+        imgs, labels = imgs.to(device), labels.to(device)
         
         optimizer.zero_grad()
+        logits = model(imgs)
+        loss = criterion(logits, labels)
         loss.backward()
         optimizer.step()
         
-        acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
-        
+        acc = (logits.argmax(dim=-1) == labels).float().mean()
         train_loss.append(loss.item())
         train_accs.append(acc.item())
         
-        train_pbar.set_postfix(
-            {"loss": sum(train_loss) / len(train_loss), "acc": sum(train_accs) / len(train_accs)}
-        )
+        # Print every 50 steps
+        if (step + 1) % 50 == 0:
+            current_loss = sum(train_loss[-50:]) / 50
+            current_acc = sum(train_accs[-50:]) / 50
+            print(f"\nStep {step+1}/{len(train_loader)}")
+            print(f"Loss: {current_loss:.4f}, Accuracy: {current_acc:.4f}")
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': sum(train_loss[-10:]) / min(len(train_loss), 10),
+            'acc': sum(train_accs[-10:]) / min(len(train_accs), 10)
+        })
     
-    train_loss = sum(train_loss) / len(train_loss)
-    train_acc = sum(train_accs) / len(train_accs)
-    
-    return train_loss, train_acc
+    scheduler.step()
+    return np.mean(train_loss), np.mean(train_accs)
 
 def valid_epoch(model, valid_loader, criterion, device):
     model.eval()
     valid_loss = []
     valid_accs = []
     
-    valid_pbar = tqdm(valid_loader, desc="[Valid]")
-    
     with torch.no_grad():
-        for batch in valid_pbar:
+        for batch in tqdm(valid_loader, desc="Validation"):
             imgs, labels = batch
-            logits = model(imgs.to(device))
-            loss = criterion(logits, labels.to(device))
-            acc = (logits.argmax(dim=-1) == labels.to(device)).float().mean()
+            imgs, labels = imgs.to(device), labels.to(device)
             
+            logits = model(imgs)
+            loss = criterion(logits, labels)
+            
+            acc = (logits.argmax(dim=-1) == labels).float().mean()
             valid_loss.append(loss.item())
             valid_accs.append(acc.item())
-            
-            valid_pbar.set_postfix(
-                {"loss": sum(valid_loss) / len(valid_loss), "acc": sum(valid_accs) / len(valid_accs)}
-            )
     
-    valid_loss = sum(valid_loss) / len(valid_loss)
-    valid_acc = sum(valid_accs) / len(valid_accs)
-    
-    return valid_loss, valid_acc
+    return np.mean(valid_loss), np.mean(valid_accs)
 
-def generate_predictions(model, loader, device):
+def main():
+    # Initialize wandb
+    wandb.init(project=project_name, name=_exp_name, config={
+        "learning_rate": 0.0005,
+        "epochs": 100,
+        "batch_size": 64,
+        "model": "EfficientNetB0",
+        "optimizer": "AdamW",
+        "scheduler": "CosineAnnealingWarmRestarts",
+        "scheduler_T0": 20,
+        "scheduler_T_mult": 1,
+        "scheduler_eta_min": 1e-6,
+        "weight_decay": 1e-5,
+        "label_smoothing": 0.1
+    })
+    
+    # Hyperparameters
+    batch_size = 64
+    n_epochs = 100
+    patience = 15
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # Dataset directory
+    _dataset_dir = "/content/data/"
+    
+    # Load datasets
+    train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
+    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
+    
+    # Initial training dataloaders
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    
+    # Calculate class weights
+    class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
+    
+    # Initialize model, criterion with class weights, optimizer, scheduler
+    model = ResNet18(num_classes=11).to(device)
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    
+    # Phase 1: Initial scheduler
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer, 
+        T_0=10,           # First restart at epoch 20
+        T_mult=2,         # Keep same cycle length
+        eta_min=1e-5,     # Minimum learning rate
+        last_epoch=-1
+    )
+    
+    # Update wandb config to include class weights information
+    wandb.config.update({
+        "class_weights_enabled": True,
+        "class_weights": class_weights.cpu().tolist()
+    })
+    
+    # First phase: Train with validation
+    print("Phase 1: Training with validation...")
+    best_acc = 0
+    best_state = None
+    stale = 0
+    
+    for epoch in range(n_epochs):
+        # Training
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch)
+        
+        # Validation
+        valid_loss, valid_acc = valid_epoch(model, valid_loader, criterion, device)
+        
+        # Logging
+        wandb.log({
+            "phase1/train_loss": train_loss,
+            "phase1/train_acc": train_acc,
+            "phase1/valid_loss": valid_loss,
+            "phase1/valid_acc": valid_acc,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "epoch": epoch + 1
+        })
+        
+        # Save best model and check early stopping
+        if valid_acc > best_acc:
+            best_acc = valid_acc
+            best_state = model.state_dict().copy()
+            print(f"Best model saved at epoch {epoch+1} with accuracy: {best_acc:.4f}")
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+    
+    # Second phase: Train on full dataset with fewer epochs
+    print("\nPhase 2: Training on full dataset...")
+    n_epochs_phase2 = 50  # Reduced epochs for phase 2
+    
+    # Combine datasets and create new dataloader
+    full_dataset = ConcatDataset([train_set, valid_set])
+    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    
+    # Initialize model with best weights from phase 1
+    model = ResNet18(num_classes=11).to(device)
+    model.load_state_dict(best_state)
+    
+    # Reset optimizer and scheduler for phase 2 with adjusted epochs
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer, 
+        T_0=20,           # Shorter cycle for phase 2
+        T_mult=1,         # Keep same cycle length
+        eta_min=1e-5,     # Minimum learning rate
+        last_epoch=-1
+    )
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)  # Use same weights
+    
+    # Train on full dataset
+    best_acc_phase2 = 0
+    stale = 0
+    
+    for epoch in range(n_epochs_phase2):
+        model.train()
+        loss, acc = train_epoch(model, full_loader, criterion, optimizer, scheduler, device, epoch)
+        
+        # Logging
+        wandb.log({
+            "phase2/train_loss": loss,
+            "phase2/train_acc": acc,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "epoch": epoch + 1
+        })
+        
+        # Save best model and check early stopping for phase 2
+        if acc > best_acc_phase2:
+            best_acc_phase2 = acc
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'epoch': epoch + 1,
+                'final_acc': acc
+            }, f"{_exp_name}_final.ckpt")
+            print(f"Best model saved at epoch {epoch+1} with accuracy: {acc:.4f}")
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs in phase 2")
+                break
+    
+    wandb.finish()
+    return model
+
+def test_prediction():
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _dataset_dir = "/content/data/"
+    batch_size = 64
+    
+    # Load test dataset
+    test_set = FoodDataset(os.path.join(_dataset_dir, "test"), tfm=test_tfm, is_test=True)
+    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
+    
+    # Load final model
+    model = ResNet18(num_classes=11).to(device)
+    checkpoint = torch.load(f"{_exp_name}_final.ckpt")
+    model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
+    
+    # Generate predictions
     predictions = []
+    file_ids = []
     
     with torch.no_grad():
-        for data, _, _ in tqdm(loader, desc="Generating predictions"):
+        for data, _, file_id in tqdm(test_loader, desc="Generating predictions"):
             outputs = model(data.to(device))
             preds = outputs.argmax(dim=1).cpu().numpy()
             predictions.extend(preds)
+            file_ids.extend(file_id)
     
-    return predictions
-
-def create_submission(predictions, files):
-    file_ids = [os.path.basename(f).split(".")[0] for f in files]
-    df = pd.DataFrame({"ID": file_ids, "Category": predictions})
+    # Create submission file
+    df = pd.DataFrame({
+        "ID": file_ids,
+        "Category": predictions
+    })
     df.to_csv("submission.csv", index=False)
     print("Submission file created successfully!")
+
 
 if __name__ == "__main__":
     main()
