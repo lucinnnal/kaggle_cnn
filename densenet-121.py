@@ -269,8 +269,8 @@ def main():
     
     # Hyperparameters
     batch_size = 64
-    n_epochs = 100
-    patience = 15
+    n_epochs = 150
+    patience = 30
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Dataset directory
@@ -295,8 +295,8 @@ def main():
     # Phase 1: Initial scheduler
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=70,           # First restart at epoch 20
-        T_mult=1,         # Keep same cycle length
+        T_0=80,           # First restart at epoch 20
+        T_mult=0.5,         # Keep same cycle length
         eta_min=1e-7,     # Minimum learning rate
         last_epoch=-1
     )
@@ -367,7 +367,7 @@ def main():
     model.load_state_dict(best_state)
     
     # Reset optimizer and scheduler for phase 2 with adjusted epochs
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0002, weight_decay=1e-5)
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
         T_0=30,           # First restart at epoch 20
