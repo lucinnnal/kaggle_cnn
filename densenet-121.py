@@ -81,67 +81,88 @@ class FoodDataset(Dataset):
             label = int(fname.split("/")[-1].split("_")[0])
             return im, label
 
-class BasicBlock(nn.Module):
-    expansion = 1
-
-    def __init__(self, in_planes, planes, stride=1):
-        super(BasicBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
-        self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_planes != self.expansion*planes:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_planes, self.expansion*planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(self.expansion*planes)
-            )
-
+class DenseLayer(nn.Module):
+    def __init__(self, in_channels, growth_rate):
+        super(DenseLayer, self).__init__()
+        self.bn1 = nn.BatchNorm2d(in_channels)
+        self.conv1 = nn.Conv2d(in_channels, 4 * growth_rate, kernel_size=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(4 * growth_rate)
+        self.conv2 = nn.Conv2d(4 * growth_rate, growth_rate, kernel_size=3, padding=1, bias=False)
+        
     def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
+        out = self.conv1(F.relu(self.bn1(x)))
+        out = self.conv2(F.relu(self.bn2(out)))
+        return torch.cat([x, out], 1)
 
-class ResNet18(nn.Module):
-    def __init__(self, num_classes=11):
-        super(ResNet18, self).__init__()
-        self.in_planes = 64
+class DenseBlock(nn.Module):
+    def __init__(self, in_channels, num_layers, growth_rate):
+        super(DenseBlock, self).__init__()
+        layers = []
+        for i in range(num_layers):
+            layers.append(DenseLayer(in_channels + i * growth_rate, growth_rate))
+        self.layers = nn.Sequential(*layers)
+        
+    def forward(self, x):
+        return self.layers(x)
 
-        # Initial convolution layer for 224x224 input
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),  # 112x112
+class TransitionLayer(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(TransitionLayer, self).__init__()
+        self.bn = nn.BatchNorm2d(in_channels)
+        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False)
+        self.pool = nn.AvgPool2d(kernel_size=2, stride=2)
+        
+    def forward(self, x):
+        return self.pool(self.conv(F.relu(self.bn(x))))
+
+class DenseNet121(nn.Module):
+    def __init__(self, num_classes=11, growth_rate=32):
+        super(DenseNet121, self).__init__()
+        
+        # Initial convolution
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 56x56
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         )
-
-        # ResNet stages
-        self.layer1 = self._make_layer(BasicBlock, 64, 2, stride=1)   # 56x56
-        self.layer2 = self._make_layer(BasicBlock, 128, 2, stride=2)  # 28x28
-        self.layer3 = self._make_layer(BasicBlock, 256, 2, stride=2)  # 14x14
-        self.layer4 = self._make_layer(BasicBlock, 512, 2, stride=2)  # 7x7
-
-        # Global average pooling and classifier
+        
+        # Dense blocks
+        num_channels = 64
+        
+        # Dense Block 1
+        self.denseblock1 = DenseBlock(num_channels, 6, growth_rate)
+        num_channels += 6 * growth_rate
+        self.transition1 = TransitionLayer(num_channels, num_channels // 2)
+        num_channels = num_channels // 2
+        
+        # Dense Block 2
+        self.denseblock2 = DenseBlock(num_channels, 12, growth_rate)
+        num_channels += 12 * growth_rate
+        self.transition2 = TransitionLayer(num_channels, num_channels // 2)
+        num_channels = num_channels // 2
+        
+        # Dense Block 3
+        self.denseblock3 = DenseBlock(num_channels, 24, growth_rate)
+        num_channels += 24 * growth_rate
+        self.transition3 = TransitionLayer(num_channels, num_channels // 2)
+        num_channels = num_channels // 2
+        
+        # Dense Block 4
+        self.denseblock4 = DenseBlock(num_channels, 16, growth_rate)
+        num_channels += 16 * growth_rate
+        
+        # Final layers
+        self.bn = nn.BatchNorm2d(num_channels)
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Sequential(
             nn.Dropout(0.4),
-            nn.Linear(512 * BasicBlock.expansion, num_classes)
+            nn.Linear(num_channels, num_classes)
         )
-
-        # Initialize weights
+        
+        # Weight initialization
         self._initialize_weights()
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
+    
     def _initialize_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -152,76 +173,23 @@ class ResNet18(nn.Module):
             elif isinstance(m, nn.Linear):
                 nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.constant_(m.bias, 0)
-
+    
     def forward(self, x):
-        x = self.conv1(x)      # [B, 64, 56, 56]
-        x = self.layer1(x)     # [B, 64, 56, 56]
-        x = self.layer2(x)     # [B, 128, 28, 28]
-        x = self.layer3(x)     # [B, 256, 14, 14]
-        x = self.layer4(x)     # [B, 512, 7, 7]
+        x = self.features(x)
         
-        x = self.avgpool(x)    # [B, 512, 1, 1]
-        x = x.view(x.size(0), -1)
-        x = self.fc(x)
+        x = self.denseblock1(x)
+        x = self.transition1(x)
         
-        return x
-
-class ResNet34(nn.Module):
-    def __init__(self, num_classes=11):
-        super(ResNet34, self).__init__()
-        self.in_planes = 64
-
-        # Initial convolution layer for 224x224 input
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),  # 112x112
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 56x56
-        )
-
-        # ResNet stages (main difference from ResNet18 is the number of blocks)
-        self.layer1 = self._make_layer(BasicBlock, 64, 3, stride=1)   # 56x56
-        self.layer2 = self._make_layer(BasicBlock, 128, 4, stride=2)  # 28x28
-        self.layer3 = self._make_layer(BasicBlock, 256, 6, stride=2)  # 14x14
-        self.layer4 = self._make_layer(BasicBlock, 512, 3, stride=2)  # 7x7
-
-        # Global average pooling and classifier
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-        self.fc = nn.Sequential(
-            nn.Dropout(0.4),
-            nn.Linear(512 * BasicBlock.expansion, num_classes)
-        )
-
-        # Initialize weights
-        self._initialize_weights()
-
-    def _make_layer(self, block, planes, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_planes, planes, stride))
-            self.in_planes = planes * block.expansion
-        return nn.Sequential(*layers)
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
-
-    def forward(self, x):
-        x = self.conv1(x)      # [B, 64, 56, 56]
-        x = self.layer1(x)     # [B, 64, 56, 56]
-        x = self.layer2(x)     # [B, 128, 28, 28]
-        x = self.layer3(x)     # [B, 256, 14, 14]
-        x = self.layer4(x)     # [B, 512, 7, 7]
+        x = self.denseblock2(x)
+        x = self.transition2(x)
         
-        x = self.avgpool(x)    # [B, 512, 1, 1]
+        x = self.denseblock3(x)
+        x = self.transition3(x)
+        
+        x = self.denseblock4(x)
+        
+        x = F.relu(self.bn(x))
+        x = self.avgpool(x)
         x = x.view(x.size(0), -1)
         x = self.fc(x)
         
@@ -320,7 +288,7 @@ def main():
     class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
     
     # Initialize model, criterion with class weights, optimizer, scheduler
-    model = ResNet34(num_classes=11).to(device)
+    model = DenseNet121(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
     
@@ -395,7 +363,7 @@ def main():
     full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
     # Initialize model with best weights from phase 1
-    model = ResNet34(num_classes=11).to(device)
+    model = DenseNet121(num_classes=11).to(device)
     model.load_state_dict(best_state)
     
     # Reset optimizer and scheduler for phase 2 with adjusted epochs
@@ -458,7 +426,7 @@ def test_prediction():
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     # Load final model
-    model = ResNet34(num_classes=11).to(device)
+    model = DenseNet121(num_classes=11).to(device)
     checkpoint = torch.load(f"{_exp_name}_final.ckpt")
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
