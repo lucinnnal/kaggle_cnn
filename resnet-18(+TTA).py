@@ -14,7 +14,6 @@ import wandb
 from utils import calculate_class_weights
 import torch.nn.functional as F
 from datetime import datetime
-from sklearn.model_selection import StratifiedKFold
 
 # This is for the progress bar.
 from tqdm.auto import tqdm
@@ -24,6 +23,7 @@ import random
 _exp_name = "food_classification_improved"
 project_name = "food_classification"
 
+"""
 # Set a random seed for reproducibility
 myseed = 6666
 torch.backends.cudnn.deterministic = True
@@ -33,6 +33,7 @@ torch.manual_seed(myseed)
 random.seed(myseed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(myseed)
+"""
 
 # Enhanced data transformations for training with various augmentations
 train_tfm = transforms.Compose([
@@ -223,366 +224,170 @@ def valid_epoch(model, valid_loader, criterion, device):
     
     return np.mean(valid_loss), np.mean(valid_accs)
 
-def load_fold_models(n_folds, device):
-    """Load the best models from each fold"""
-    fold_models = []
-    
-    # Find checkpoint files for each fold
-    for fold in range(n_folds):
-        checkpoints = [f for f in os.listdir('.') if f.startswith(f"{_exp_name}_fold{fold+1}") and f.endswith('.ckpt')]
-        if not checkpoints:
-            raise ValueError(f"No checkpoint found for fold {fold+1}")
-            
-        # Sort by accuracy (assuming filename format includes acc{value})
-        latest_checkpoint = sorted(checkpoints, key=lambda x: float(x.split('acc')[-1].split('.ckpt')[0]))[-1]
-        
-        # Load model
-        model = ResNet18(num_classes=11).to(device)
-        checkpoint = torch.load(latest_checkpoint)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-        fold_models.append(model)
-        
-        print(f"Loaded model from {latest_checkpoint}")
-    
-    return fold_models
-
-def train_final_model(all_data, pseudo_dataset, device, class_weights):
-    """Train final model on full dataset including pseudo labels"""
-    print("\nTraining final model on full dataset with pseudo labels...")
-    
-    # Hyperparameters
-    batch_size = 64
-    n_epochs = 50
-    patience = 15
-    
-    # Combine all data
-    final_dataset = ConcatDataset([all_data, pseudo_dataset])
-    final_loader = DataLoader(final_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    
-    # Initialize final model
-    final_model = ResNet18(num_classes=11).to(device)
-    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(final_model.parameters(), lr=0.0005, weight_decay=1e-4)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=30, T_mult=1, eta_min=1e-7)
-    
-    best_acc = 0
-    stale = 0
-    
-    for epoch in range(n_epochs):
-        loss, acc = train_epoch(final_model, final_loader, criterion, optimizer, scheduler, device, epoch)
-        
-        wandb.log({
-            "final_phase/train_loss": loss,
-            "final_phase/train_acc": acc,
-            "learning_rate": optimizer.param_groups[0]['lr'],
-            "epoch": epoch + 1
-        })
-        
-        if acc > best_acc:
-            best_acc = acc
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            save_path = f"{_exp_name}_final_{timestamp}_acc{acc:.4f}.ckpt"
-            torch.save({
-                'model_state_dict': final_model.state_dict(),
-                'epoch': epoch + 1,
-                'final_acc': acc
-            }, save_path)
-            print(f"Saved best model with accuracy: {acc:.4f}")
-            stale = 0
-        else:
-            stale += 1
-            if stale >= patience:
-                print("Early stopping triggered")
-                break
-    
-    return final_model
-
-def fine_tune_fold_model(model, valid_set, device, fold_idx):
-    """Fine-tune a fold model on validation dataset"""
-    print(f"\nFine-tuning fold {fold_idx + 1} model on validation set...")
-    
-    batch_size = 64
-    n_epochs = 50  # Reduced epochs for fine-tuning
-    patience = 15
-    
-    # Create validation dataloader
-    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    
-    # Setup training
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-4)  # Lower learning rate
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=1, eta_min=1e-7)
-    
-    best_acc = 0
-    stale = 0
-    best_state = None
-    
-    for epoch in range(n_epochs):
-        loss, acc = train_epoch(model, valid_loader, criterion, optimizer, scheduler, device, epoch)
-        
-        wandb.log({
-            f"fold_{fold_idx+1}_finetune/train_loss": loss,
-            f"fold_{fold_idx+1}_finetune/train_acc": acc,
-            "learning_rate": optimizer.param_groups[0]['lr'],
-            "epoch": epoch + 1
-        })
-        
-        if acc > best_acc:
-            best_acc = acc
-            best_state = model.state_dict().copy()
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            save_path = f"{_exp_name}_fold{fold_idx+1}_finetuned_{timestamp}_acc{acc:.4f}.ckpt"
-            torch.save({
-                'model_state_dict': model.state_dict(),
-                'acc': acc,
-            }, save_path)
-            stale = 0
-        else:
-            stale += 1
-            if stale >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-    
-    model.load_state_dict(best_state)
-    return model
-
-def ensemble_predict(models, test_loader, device):
-    """Generate ensemble predictions from multiple models using TTA"""
-    print("\nGenerating ensemble predictions with TTA...")
-    
-    # Define TTA transforms
-    tta_transforms = [
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((224, 224)),
-            transforms.RandomHorizontalFlip(p=1.0),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-        transforms.Compose([
-            transforms.Resize((248, 248)),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-    ]
-    
-    all_predictions = []
-    file_ids = []
-    
-    with torch.no_grad():
-        for data, _, file_id in tqdm(test_loader, desc="Generating ensemble predictions"):
-            batch_predictions = []
-            
-            # For each model
-            for model in models:
-                model.eval()
-                model_predictions = []
-                
-                # Apply TTA
-                for transform in tta_transforms:
-                    transformed_data = torch.stack([
-                        transform(Image.fromarray(
-                            (data[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-                        ))
-                        for i in range(data.size(0))
-                    ]).to(device)
-                    
-                    outputs = model(transformed_data)
-                    model_predictions.append(torch.softmax(outputs, dim=1))
-                
-                # Average TTA predictions for this model
-                model_pred = torch.stack(model_predictions).mean(0)
-                batch_predictions.append(model_pred)
-            
-            # Average predictions from all models
-            final_predictions = torch.stack(batch_predictions).mean(0)
-            all_predictions.append(final_predictions.argmax(dim=1).cpu())
-            file_ids.extend(file_id)
-    
-    return torch.cat(all_predictions), file_ids
-
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
         "learning_rate": 0.0005,
         "epochs": 100,
         "batch_size": 64,
-        "model": "ResNet18",
-        "folds": 5,
-        "pseudo_threshold": 0.9,  # Confidence threshold for pseudo labeling
+        "model": "ResNet18-kaggle",
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingWarmRestarts",
-        "scheduler_T0": 100,
+        "scheduler_T0": 30,
         "scheduler_T_mult": 1,
         "scheduler_eta_min": 1e-7,
-        "weight_decay": 1e-4,
+        "weight_decay": 1e-5,
         "label_smoothing": 0.1
     })
     
     # Hyperparameters
     batch_size = 64
-    n_epochs = 100
-    patience = 20
+    n_epochs = 150
+    patience = 30
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    n_folds = 5
-    pseudo_threshold = 0.9
     
     # Dataset directory
     _dataset_dir = "/content/data/"
     
-    # Load all datasets
+    # Load datasets
     train_set = FoodDataset(os.path.join(_dataset_dir, "train"), tfm=train_tfm)
     valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=test_tfm)
-    test_set = FoodDataset(os.path.join(_dataset_dir, "test"), tfm=test_tfm, is_test=True)
     
-    # Combine train and validation sets
-    all_data = ConcatDataset([train_set, valid_set])
+    # Initial training dataloaders
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    valid_loader = DataLoader(valid_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
-    # Prepare labels for stratification
-    all_labels = []
-    for dataset in [train_set, valid_set]:
-        all_labels.extend([int(f.split("/")[-1].split("_")[0]) for f in dataset.files])
-    all_labels = np.array(all_labels)
-    
-    # Calculate class weights once
+    # Calculate class weights
     class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
     
-    # Initialize arrays for fold results and test predictions
-    fold_models = []
-    test_predictions = []
-    
-    # Stratified K-Fold cross validation
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=myseed)
-    
-    # First phase: Train fold models
-    for fold, (train_idx, val_idx) in enumerate(skf.split(np.zeros(len(all_labels)), all_labels)):
-        print(f"\nTraining Fold {fold + 1}/{n_folds}")
-        
-        # Create fold datasets
-        train_fold = Subset(all_data, train_idx)
-        val_fold = Subset(all_data, val_idx)
-        
-        train_loader = DataLoader(train_fold, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-        valid_loader = DataLoader(val_fold, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-        
-        # Initialize model, criterion, optimizer, scheduler
-        model = ResNet18(num_classes=11).to(device)
-        criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=100, T_mult=1, eta_min=1e-7)
-        
-        best_acc = 0
-        best_state = None
-        stale = 0
-        
-        for epoch in range(n_epochs):
-            train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch)
-            valid_loss, valid_acc = valid_epoch(model, valid_loader, criterion, device)
-            
-            wandb.log({
-                f"fold_{fold+1}/train_loss": train_loss,
-                f"fold_{fold+1}/train_acc": train_acc,
-                f"fold_{fold+1}/valid_loss": valid_loss,
-                f"fold_{fold+1}/valid_acc": valid_acc,
-                "learning_rate": optimizer.param_groups[0]['lr'],
-                "epoch": epoch + 1
-            })
-            
-            if valid_acc > best_acc:
-                best_acc = valid_acc
-                best_state = model.state_dict().copy()
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                save_path = f"{_exp_name}_fold{fold+1}_{timestamp}_acc{best_acc:.4f}.ckpt"
-                torch.save({
-                    'fold': fold + 1,
-                    'model_state_dict': model.state_dict(),
-                    'best_acc': best_acc,
-                }, save_path)
-                stale = 0
-            else:
-                stale += 1
-                if stale >= patience:
-                    break
-        
-        # Load best state and save model
-        model.load_state_dict(best_state)
-        fold_models.append(model)
-        
-        # Generate predictions for test set
-        model.eval()
-        test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-        fold_preds = []
-        
-        with torch.no_grad():
-            for data, _, _ in test_loader:
-                outputs = model(data.to(device))
-                probs = torch.softmax(outputs, dim=1)
-                fold_preds.append(probs)
-        
-        fold_preds = torch.cat(fold_preds, dim=0)
-        test_predictions.append(fold_preds)
-    
-    # Average predictions from all folds
-    test_predictions = torch.stack(test_predictions)
-    ensemble_probs = test_predictions.mean(0)
-    ensemble_preds = ensemble_probs.argmax(1)
-    max_probs, _ = ensemble_probs.max(1)
-    
-    # Generate pseudo labels for high confidence predictions
-    pseudo_mask = max_probs >= pseudo_threshold
-    pseudo_labels = ensemble_preds[pseudo_mask]
-    
-    # Create pseudo-labeled dataset
-    pseudo_indices = pseudo_mask.nonzero().squeeze()
-    pseudo_data = Subset(test_set, pseudo_indices)
-    
-    # Second phase: Train final model with pseudo labels
-    print("\nTraining final model with pseudo labels...")
-    final_dataset = ConcatDataset([all_data, pseudo_data])
-    final_loader = DataLoader(final_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    
-    # Initialize final model
-    final_model = ResNet18(num_classes=11).to(device)
+    # Initialize model, criterion with class weights, optimizer, scheduler
+    model = ResNet18(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(final_model.parameters(), lr=0.0005, weight_decay=1e-4)
-    scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=70, T_mult=1, eta_min=1e-7)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
     
-    best_acc_final = 0
+    # Phase 1: Initial scheduler
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer, 
+        T_0=30,           # First restart at epoch 30
+        T_mult=1,         # Keep same cycle length
+        eta_min=1e-7,     # Minimum learning rate
+        last_epoch=-1
+    )
+    
+    # Update wandb config to include class weights information
+    wandb.config.update({
+        "class_weights_enabled": True,
+        "class_weights": class_weights.cpu().tolist()
+    })
+    
+    # First phase: Train with validation
+    print("Phase 1: Training with validation...")
+    best_acc = 0
+    best_state = None
     stale = 0
     
-    for epoch in range(50):  # Reduced epochs for final training
-        loss, acc = train_epoch(final_model, final_loader, criterion, optimizer, scheduler, device, epoch)
+    for epoch in range(n_epochs):
+        # Training
+        train_loss, train_acc = train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch)
         
+        # Validation
+        valid_loss, valid_acc = valid_epoch(model, valid_loader, criterion, device)
+        
+        # Logging
         wandb.log({
-            "final_phase/train_loss": loss,
-            "final_phase/train_acc": acc,
+            "phase1/train_loss": train_loss,
+            "phase1/train_acc": train_acc,
+            "phase1/valid_loss": valid_loss,
+            "phase1/valid_acc": valid_acc,
             "learning_rate": optimizer.param_groups[0]['lr'],
             "epoch": epoch + 1
         })
         
-        if acc > best_acc_final:
-            best_acc_final = acc
+        # Save best model and check early stopping
+        if valid_acc > best_acc:
+            best_acc = valid_acc
+            best_state = model.state_dict().copy()
+            # Save checkpoint for phase 1 with timestamp and accuracy
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            save_path = f"{_exp_name}_final_{timestamp}_acc{acc:.4f}.ckpt"
+            save_path = f"{_exp_name}_phase1_{timestamp}_acc{best_acc:.4f}.ckpt"
             torch.save({
-                'model_state_dict': final_model.state_dict(),
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'epoch': epoch + 1,
-                'final_acc': acc
+                'best_acc': best_acc,
             }, save_path)
+            print(f"Best model saved at epoch {epoch+1} with accuracy: {best_acc:.4f}")
+            # Keep track of best checkpoint path
+            best_checkpoint_path = save_path
             stale = 0
         else:
             stale += 1
             if stale >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs")
+                break
+    
+    # Second phase: Train on full dataset with fewer epochs
+    print("\nPhase 2: Training on full dataset...")
+    n_epochs_phase2 = 60  # Reduced epochs for phase 2
+    
+    # Combine datasets and create new dataloader
+    full_dataset = ConcatDataset([train_set, valid_set])
+    full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
+    
+    # Initialize model with best weights from phase 1
+    model = ResNet18(num_classes=11).to(device)
+    model.load_state_dict(best_state)
+    
+    # Reset optimizer and scheduler for phase 2 with adjusted epochs
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-5)
+    scheduler = CosineAnnealingWarmRestarts(
+        optimizer, 
+        T_0=30,           # First restart at epoch 20
+        T_mult=2,         # Keep same cycle length
+        eta_min=1e-7,     # Minimum learning rate
+        last_epoch=-1
+    )
+    criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)  # Use same weights
+    
+    # Train on full dataset
+    best_acc_phase2 = 0
+    stale = 0
+    
+    for epoch in range(n_epochs_phase2):
+        model.train()
+        loss, acc = train_epoch(model, full_loader, criterion, optimizer, scheduler, device, epoch)
+        
+        # Logging
+        wandb.log({
+            "phase2/train_loss": loss,
+            "phase2/train_acc": acc,
+            "learning_rate": optimizer.param_groups[0]['lr'],
+            "epoch": epoch + 1
+        })
+        
+        # Save best model and check early stopping for phase 2
+        if acc > best_acc_phase2:
+            best_acc_phase2 = acc
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            save_path = f"{_exp_name}_phase2_{timestamp}_acc{acc:.4f}.ckpt"
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'epoch': epoch + 1,
+                'final_acc': acc
+            }, save_path)
+            print(f"Best model saved at epoch {epoch+1} with accuracy: {acc:.4f}")
+            # Keep track of final best checkpoint path
+            final_checkpoint_path = save_path
+            stale = 0
+        else:
+            stale += 1
+            if stale >= patience:
+                print(f"Early stopping triggered after {epoch+1} epochs in phase 2")
                 break
     
     wandb.finish()
-    return final_model
+    return model
 
 def test_prediction():
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -618,57 +423,6 @@ def test_prediction():
     df.to_csv("submission.csv", index=False)
     print("Submission file created successfully!")
 
-def main_finetuning():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    _dataset_dir = "/content/data/"
-    checkpoint_dir = "/Users/kipyokim/kaggle_CNN/5fold-checkpoint"
-    batch_size = 64
-    n_folds = 5
-    
-    # Initialize wandb
-    wandb.init(project=project_name, name=f"{_exp_name}_finetuning", config={
-        "learning_rate": 0.0001,
-        "finetune_epochs": 30,
-        "batch_size": 64,
-    })
-    
-    # Load datasets
-    valid_set = FoodDataset(os.path.join(_dataset_dir, "validation"), tfm=train_tfm)
-    test_set = FoodDataset(os.path.join(_dataset_dir, "test"), tfm=test_tfm, is_test=True)
-    test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    
-    # Load and fine-tune each fold model
-    fine_tuned_models = []
-    
-    for fold in range(n_folds):
-        # Find best checkpoint for this fold
-        checkpoints = [f for f in os.listdir(checkpoint_dir) 
-                      if f.startswith(f"{_exp_name}_fold{fold+1}") and f.endswith('.ckpt')]
-        best_checkpoint = sorted(checkpoints, key=lambda x: float(x.split('acc')[-1].split('.ckpt')[0]))[-1]
-        checkpoint_path = os.path.join(checkpoint_dir, best_checkpoint)
-        
-        # Load model
-        model = ResNet18(num_classes=11).to(device)
-        checkpoint = torch.load(checkpoint_path)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        print(f"\nLoaded checkpoint: {best_checkpoint}")
-        
-        # Fine-tune on validation set
-        fine_tuned_model = fine_tune_fold_model(model, valid_set, device, fold)
-        fine_tuned_models.append(fine_tuned_model)
-    
-    # Generate ensemble predictions
-    predictions, file_ids = ensemble_predict(fine_tuned_models, test_loader, device)
-    
-    # Create submission file
-    df = pd.DataFrame({
-        "ID": file_ids,
-        "Category": predictions.numpy()
-    })
-    df.to_csv("submission_ensemble_finetuned.csv", index=False)
-    print("\nSubmission file created successfully!")
-    
-    wandb.finish()
 
 if __name__ == "__main__":
-    main_finetuning()
+    main()
