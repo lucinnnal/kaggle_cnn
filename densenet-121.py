@@ -290,14 +290,14 @@ def main():
     # Initialize model, criterion with class weights, optimizer, scheduler
     model = DenseNet121(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-5)
     
     # Phase 1: Initial scheduler
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=80,           # First restart at epoch 20
-        T_mult=0.5,         # Keep same cycle length
-        eta_min=1e-7,     # Minimum learning rate
+        T_0=150,           # First restart at epoch 20
+        T_mult=1,         # Keep same cycle length
+        eta_min=1e-8,     # Minimum learning rate
         last_epoch=-1
     )
     
@@ -367,12 +367,12 @@ def main():
     model.load_state_dict(best_state)
     
     # Reset optimizer and scheduler for phase 2 with adjusted epochs
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0002, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0001, weight_decay=1e-5)
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=30,           # First restart at epoch 20
+        T_0=70,           # First restart at epoch 20
         T_mult=1,         # Keep same cycle length
-        eta_min=1e-7,     # Minimum learning rate
+        eta_min=1e-8,     # Minimum learning rate
         last_epoch=-1
     )
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)  # Use same weights
