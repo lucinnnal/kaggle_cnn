@@ -510,7 +510,7 @@ def main():
     # Hyperparameters
     batch_size = 64
     n_epochs = 100
-    patience = 15
+    patience = 30
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Dataset directory
@@ -603,7 +603,7 @@ def main():
     full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
     # Initialize model with best weights from phase 1
-    model = ResNet18(num_classes=11).to(device)
+    model = EfficientNetB3(num_classes=11).to(device)
     model.load_state_dict(best_state)
     
     # Reset optimizer and scheduler for phase 2 with adjusted epochs
