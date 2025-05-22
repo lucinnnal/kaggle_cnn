@@ -298,8 +298,8 @@ def test_prediction():
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
         
-        # Get epoch number from checkpoint filename
-        epoch_num = ckpt_file.split('_')[-1].split('.')[0]
+        # Get accuracy from checkpoint filename
+        acc = ckpt_file.split('acc')[-1].split('.ckpt')[0]
         
         # Prediction with tqdm progress bar
         prediction = []
@@ -317,7 +317,7 @@ def test_prediction():
         df["ID"] = file_ids
         df["Category"] = prediction
         
-        # Save to final_submission folder with unique name
-        submission_path = os.path.join("final_submission", f"submission_epoch_{epoch_num}.csv")
+        # Save to final_submission folder with unique name including accuracy
+        submission_path = os.path.join("final_submission", f"submission_acc{acc}.csv")
         df.to_csv(submission_path, index=False)
         print(f"Saved submission file: {submission_path}")
