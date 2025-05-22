@@ -14,17 +14,15 @@ import wandb
 from utils import calculate_class_weights
 import torch.nn.functional as F
 from datetime import datetime
-from torchvision.transforms import RandAugment
 
 # This is for the progress bar.
 from tqdm.auto import tqdm
 import random
 
 # Set experiment name and wandb project
-_exp_name = "food_classification_improved"
-project_name = "food_classification"
+_exp_name = "food_classification"
+project_name = "food_classification_EfficientNetV2"
 
-"""
 # Set a random seed for reproducibility
 myseed = 6666
 torch.backends.cudnn.deterministic = True
@@ -34,19 +32,28 @@ torch.manual_seed(myseed)
 random.seed(myseed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(myseed)
-"""
 
 # Enhanced data transformations for training with various augmentations
 train_tfm = transforms.Compose([
+    # Resize the image into a fixed shape (224x224)
     transforms.Resize((224, 224)),
-    transforms.RandAugment(num_ops=10, magnitude=10),  # Add RandAugment
-    transforms.ToTensor()
+    # Random horizontal flip
+    transforms.RandomHorizontalFlip(p=0.5),
+    # Rotation
+    transforms.RandomRotation(30),
+    # Color Jitter
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+    # Convert to tensor
+    transforms.ToTensor(),
+    # Normalize the image
+    transforms.Normalize(mean=[0.5555, 0.4514, 0.3443], std=[0.2701, 0.2729, 0.2792]),
 ])
 
 # Test/validation transformations
 test_tfm = transforms.Compose([
     transforms.Resize((224, 224)),
-    transforms.ToTensor()
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.5555, 0.4514, 0.3443], std=[0.2701, 0.2729, 0.2792]),
 ])
 
 class FoodDataset(Dataset):
@@ -77,13 +84,12 @@ class FoodDataset(Dataset):
 class BasicBlock(nn.Module):
     expansion = 1
 
-    def __init__(self, in_planes, planes, stride=1, drop_path=0.):
+    def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn2 = nn.BatchNorm2d(planes)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != self.expansion*planes:
@@ -95,51 +101,44 @@ class BasicBlock(nn.Module):
     def forward(self, x):
         out = F.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out = self.drop_path(out)
         out += self.shortcut(x)
         out = F.relu(out)
         return out
 
 class ResNet18(nn.Module):
-    def __init__(self, num_classes=11, drop_path_rate=0.2):
+    def __init__(self, num_classes=11):
         super(ResNet18, self).__init__()
         self.in_planes = 64
-        
-        # Calculate drop path rates for each layer
-        num_blocks = [2, 2, 2, 2]
-        total_blocks = sum(num_blocks)
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, total_blocks)]
-        self.curr_block = 0
 
-        # Initial convolution layer
+        # Initial convolution layer for 224x224 input
         self.conv1 = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),
+            nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias=False),  # 112x112
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+            nn.MaxPool2d(kernel_size=3, stride=2, padding=1)  # 56x56
         )
 
-        # ResNet stages with stochastic depth
-        self.layer1 = self._make_layer(BasicBlock, 64, num_blocks[0], stride=1, dpr=dpr)
-        self.layer2 = self._make_layer(BasicBlock, 128, num_blocks[1], stride=2, dpr=dpr)
-        self.layer3 = self._make_layer(BasicBlock, 256, num_blocks[2], stride=2, dpr=dpr)
-        self.layer4 = self._make_layer(BasicBlock, 512, num_blocks[3], stride=2, dpr=dpr)
+        # ResNet stages
+        self.layer1 = self._make_layer(BasicBlock, 64, 2, stride=1)   # 56x56
+        self.layer2 = self._make_layer(BasicBlock, 128, 2, stride=2)  # 28x28
+        self.layer3 = self._make_layer(BasicBlock, 256, 2, stride=2)  # 14x14
+        self.layer4 = self._make_layer(BasicBlock, 512, 2, stride=2)  # 7x7
 
+        # Global average pooling and classifier
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Sequential(
             nn.Dropout(0.4),
             nn.Linear(512 * BasicBlock.expansion, num_classes)
         )
 
+        # Initialize weights
         self._initialize_weights()
 
-    def _make_layer(self, block, planes, num_blocks, stride, dpr):
+    def _make_layer(self, block, planes, num_blocks, stride):
         strides = [stride] + [1]*(num_blocks-1)
         layers = []
         for stride in strides:
-            layers.append(block(self.in_planes, planes, stride, 
-                              drop_path=dpr[self.curr_block]))
-            self.curr_block += 1
+            layers.append(block(self.in_planes, planes, stride))
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
@@ -167,20 +166,110 @@ class ResNet18(nn.Module):
         
         return x
 
-class DropPath(nn.Module):
-    def __init__(self, drop_prob=None):
-        super(DropPath, self).__init__()
-        self.drop_prob = drop_prob
-
+class MBConv(nn.Module):
+    def __init__(self, in_channels, out_channels, expand_ratio, stride, reduction=4):
+        super(MBConv, self).__init__()
+        self.use_residual = in_channels == out_channels and stride == 1
+        hidden_dim = in_channels * expand_ratio
+        
+        layers = []
+        # Expand
+        if expand_ratio != 1:
+            layers.extend([
+                nn.Conv2d(in_channels, hidden_dim, 1, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                nn.SiLU()
+            ])
+        
+        # Depthwise
+        layers.extend([
+            nn.Conv2d(hidden_dim, hidden_dim, 3, stride=stride, padding=1, groups=hidden_dim, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            nn.SiLU()
+        ])
+        
+        # SE
+        se_dim = max(1, in_channels // reduction)
+        layers.extend([
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(hidden_dim, se_dim, 1),
+            nn.SiLU(),
+            nn.Conv2d(se_dim, hidden_dim, 1),
+            nn.Sigmoid()
+        ])
+        
+        # Project
+        layers.extend([
+            nn.Conv2d(hidden_dim, out_channels, 1, bias=False),
+            nn.BatchNorm2d(out_channels)
+        ])
+        
+        self.conv = nn.Sequential(*layers)
+        
     def forward(self, x):
-        if self.drop_prob == 0. or not self.training:
-            return x
-        keep_prob = 1 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        random_tensor.floor_()  # binarize
-        output = x.div(keep_prob) * random_tensor
-        return output
+        if self.use_residual:
+            return x + self.conv(x)
+        else:
+            return self.conv(x)
+
+class EfficientNetV2(nn.Module):
+    def __init__(self, num_classes=11):
+        super(EfficientNetV2, self).__init__()
+        
+        # Initial conv
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3, 24, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(24),
+            nn.SiLU()
+        )
+        
+        # Fused-MBConv and MBConv blocks
+        self.block1 = self._make_layer(24, 48, 2, stride=1)  # Fused-MBConv
+        self.block2 = self._make_layer(48, 64, 2, stride=2)  # Fused-MBConv
+        self.block3 = self._make_layer(64, 128, 3, stride=2)  # MBConv
+        self.block4 = self._make_layer(128, 160, 5, stride=2)  # MBConv
+        self.block5 = self._make_layer(160, 256, 5, stride=1)  # MBConv
+        
+        # Head
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(0.4),
+            nn.Linear(256, num_classes)
+        )
+        
+        # Initialize weights
+        self._initialize_weights()
+    
+    def _make_layer(self, in_channels, out_channels, blocks, stride):
+        layers = []
+        layers.append(MBConv(in_channels, out_channels, expand_ratio=4, stride=stride))
+        for _ in range(1, blocks):
+            layers.append(MBConv(out_channels, out_channels, expand_ratio=4, stride=1))
+        return nn.Sequential(*layers)
+    
+    def _initialize_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.zeros_(m.bias)
+    
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = self.block4(x)
+        x = self.block5(x)
+        x = self.head(x)
+        return x
 
 def train_epoch(model, train_loader, criterion, optimizer, scheduler, device, epoch):
     model.train()
@@ -241,23 +330,23 @@ def valid_epoch(model, valid_loader, criterion, device):
 def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
-        "learning_rate": 0.0005,
-        "epochs": 100,
+        "learning_rate": 0.0003,
+        "epochs": 300,
         "batch_size": 64,
-        "model": "ResNet18-kaggle",
+        "model": "EfficientNetV2",
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingWarmRestarts",
         "scheduler_T0": 30,
-        "scheduler_T_mult": 1,
-        "scheduler_eta_min": 1e-7,
+        "scheduler_T_mult": 2,
+        "scheduler_eta_min": 1e-6,
         "weight_decay": 1e-5,
         "label_smoothing": 0.1
     })
     
     # Hyperparameters
     batch_size = 64
-    n_epochs = 150
-    patience = 30
+    n_epochs = 200
+    patience = 50
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Dataset directory
@@ -274,25 +363,17 @@ def main():
     # Calculate class weights
     class_weights = calculate_class_weights(os.path.join(_dataset_dir, "train")).to(device)
     
-    # Initialize model with Stochastic Depth
-    model = ResNet18(num_classes=11, drop_path_rate=0.2).to(device)
-    
-    # Update wandb config
-    wandb.config.update({
-        "drop_path_rate": 0.2,
-        "randaugment_ops": 2,
-        "randaugment_magnitude": 9
-    })
-    
+    # Initialize model, criterion with class weights, optimizer, scheduler
+    model = EfficientNetV2(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-4)
     
     # Phase 1: Initial scheduler
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=30,           # First restart at epoch 30
-        T_mult=1,         # Keep same cycle length
-        eta_min=1e-7,     # Minimum learning rate
+        T_0=30,           # First restart at epoch 20
+        T_mult=2,         # Keep same cycle length
+        eta_min=1e-8,     # Minimum learning rate
         last_epoch=-1
     )
     
@@ -351,21 +432,21 @@ def main():
     
     # Second phase: Train on full dataset with fewer epochs
     print("\nPhase 2: Training on full dataset...")
-    n_epochs_phase2 = 60  # Reduced epochs for phase 2
+    n_epochs_phase2 = 100  # Reduced epochs for phase 2
     
     # Combine datasets and create new dataloader
     full_dataset = ConcatDataset([train_set, valid_set])
     full_loader = DataLoader(full_dataset, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
     
     # Initialize model with best weights from phase 1
-    model = ResNet18(num_classes=11).to(device)
+    model = EfficientNetV2(num_classes=11).to(device)
     model.load_state_dict(best_state)
     
     # Reset optimizer and scheduler for phase 2 with adjusted epochs
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0003, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0002, weight_decay=1e-4)
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=30,           # First restart at epoch 20
+        T_0=20,           # First restart at epoch 20
         T_mult=2,         # Keep same cycle length
         eta_min=1e-7,     # Minimum learning rate
         last_epoch=-1
@@ -421,7 +502,7 @@ def test_prediction():
     test_loader = DataLoader(test_set, batch_size=batch_size, shuffle=False, num_workers=4, pin_memory=True)
     
     # Load final model
-    model = ResNet18(num_classes=11).to(device)
+    model = EfficientNetV2(num_classes=11).to(device)
     checkpoint = torch.load(f"{_exp_name}_final.ckpt")
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()

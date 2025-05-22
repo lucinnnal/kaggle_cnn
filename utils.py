@@ -12,31 +12,6 @@ from torch.utils.data import ConcatDataset, DataLoader, Subset, Dataset
 from torchvision.datasets import DatasetFolder, VisionDataset
 from sklearn.utils.class_weight import compute_class_weight
 
-class FoodDataset(Dataset):
-    def __init__(self, path, tfm=None, files=None, is_test=False):
-        super(FoodDataset).__init__()
-        self.path = path
-        self.is_test = is_test
-        self.files = sorted([os.path.join(path, x) for x in os.listdir(path) if x.endswith(".jpg")])
-        if files is not None:
-            self.files = files
-        print(f"One {path} sample", self.files[0])
-        self.transform = tfm
-
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        fname = self.files[idx]
-        im = Image.open(fname).convert('RGB')  # Ensure RGB format
-        im = self.transform(im)
-        file_id = os.path.basename(fname).split(".")[0]  # Extract the ID from the filename
-        if self.is_test:
-            return im, -1, file_id  # Return file_id only for test set
-        else:
-            label = int(fname.split("/")[-1].split("_")[0])
-            return im, label
-
 def visualize_label_distribution(dataset_path):
     """
     데이터셋의 라벨 분포를 시각화하는 함수
@@ -72,6 +47,7 @@ def visualize_label_distribution(dataset_path):
     total_images = sum(label_counts.values())
     plt.text(0.02, 0.95, f'Total Images: {total_images}', 
              transform=plt.gca().transAxes)
+    plt.savefig('label_distribution.png')
     
     return label_counts
 
@@ -104,29 +80,11 @@ def calculate_class_weights(dataset_path):
     class_weights = torch.FloatTensor(weights)
     
     return class_weights
-
-# 사용 예시
 if __name__ == "__main__":
-    train_path = "./data/train"  # 경로는 실제 데이터셋 위치로 수정하세요
-    label_counts = visualize_label_distribution(train_path)
-    plt.show()
+    # 데이터셋 경로
+    dataset_path = './data/train'
     
-    # 각 클래스별 비율 출력
-    total = sum(label_counts.values())
-    print("\nClass distribution:")
-    for label, count in label_counts.items():
-        percentage = (count / total) * 100
-        print(f"Class {label}: {count} images ({percentage:.2f}%)")
-    
-    # 클래스 가중치 계산
-    class_weights = calculate_class_weights(train_path)
-    
-    print("\nClass weights:")
-    for i, weight in enumerate(class_weights):
-        print(f"Class {i}: {weight:.4f}")
-    
-    # Cross Entropy Loss에 가중치 적용 예시
-    criterion = nn.CrossEntropyLoss(
-        weight=class_weights.to(device),
-        label_smoothing=0.1
-    )
+    # 라벨 분포 시각화
+    label_counts = visualize_label_distribution(dataset_path)
+
+    class_weights = calculate_class_weights(dataset_path)

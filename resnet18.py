@@ -23,7 +23,6 @@ import random
 _exp_name = "food_classification_improved"
 project_name = "food_classification"
 
-"""
 # Set a random seed for reproducibility
 myseed = 6666
 torch.backends.cudnn.deterministic = True
@@ -33,13 +32,17 @@ torch.manual_seed(myseed)
 random.seed(myseed)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(myseed)
-"""
 
 # Enhanced data transformations for training with various augmentations
 train_tfm = transforms.Compose([
     # Resize the image into a fixed shape (224x224)
     transforms.Resize((224, 224)),
-    transforms.RandAugment(num_ops=10, magnitude=10),  # Add RandAugment
+    # Random horizontal flip
+    transforms.RandomHorizontalFlip(p=0.5),
+    # Rotation
+    transforms.RandomRotation(30),
+    # Color Jitter
+    transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
     # Convert to tensor
     transforms.ToTensor(),
     # Normalize the image
@@ -223,22 +226,22 @@ def main():
     # Initialize wandb
     wandb.init(project=project_name, name=_exp_name, config={
         "learning_rate": 0.0005,
-        "epochs": 500,
+        "epochs": 100,
         "batch_size": 64,
-        "model": "ResNet18-300",
+        "model": "EfficientNetB0",
         "optimizer": "AdamW",
         "scheduler": "CosineAnnealingWarmRestarts",
-        "scheduler_T0": 50,
-        "scheduler_T_mult": 2,
-        "scheduler_eta_min": 1e-8,
+        "scheduler_T0": 20,
+        "scheduler_T_mult": 1,
+        "scheduler_eta_min": 1e-6,
         "weight_decay": 1e-5,
         "label_smoothing": 0.1
     })
     
     # Hyperparameters
     batch_size = 64
-    n_epochs = 500
-    patience = 50
+    n_epochs = 100
+    patience = 15
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Dataset directory
@@ -258,14 +261,14 @@ def main():
     # Initialize model, criterion with class weights, optimizer, scheduler
     model = ResNet18(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
     
     # Phase 1: Initial scheduler
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=50,           # First restart at epoch 30
-        T_mult=2,         # Keep same cycle length
-        eta_min=1e-8,     # Minimum learning rate
+        T_0=30,           # First restart at epoch 20
+        T_mult=1,         # Keep same cycle length
+        eta_min=1e-7,     # Minimum learning rate
         last_epoch=-1
     )
     
@@ -324,7 +327,7 @@ def main():
     
     # Second phase: Train on full dataset with fewer epochs
     print("\nPhase 2: Training on full dataset...")
-    n_epochs_phase2 = 100  # Reduced epochs for phase 2
+    n_epochs_phase2 = 50  # Reduced epochs for phase 2
     
     # Combine datasets and create new dataloader
     full_dataset = ConcatDataset([train_set, valid_set])
@@ -335,12 +338,12 @@ def main():
     model.load_state_dict(best_state)
     
     # Reset optimizer and scheduler for phase 2 with adjusted epochs
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.0005, weight_decay=1e-5)
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
-        T_0=100,           # First restart at epoch 20
-        T_mult=2,         # Keep same cycle length
-        eta_min=1e-8,     # Minimum learning rate
+        T_0=30,           # First restart at epoch 20
+        T_mult=1,         # Keep same cycle length
+        eta_min=1e-7,     # Minimum learning rate
         last_epoch=-1
     )
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)  # Use same weights
