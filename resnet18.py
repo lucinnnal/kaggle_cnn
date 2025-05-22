@@ -258,7 +258,7 @@ def main():
     # Initialize model, criterion with class weights, optimizer, scheduler
     model = ResNet18(num_classes=11).to(device)
     criterion = nn.CrossEntropyLoss(weight=class_weights, label_smoothing=0.1)
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.0005)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0005, weight_decay=1e-4)
     
     # Phase 1: Initial scheduler
     scheduler = CosineAnnealingWarmRestarts(
@@ -335,7 +335,7 @@ def main():
     model.load_state_dict(best_state)
     
     # Reset optimizer and scheduler for phase 2 with adjusted epochs
-    optimizer = torch.optim.SGD(model.parameters(), lr=0.0002)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-4)
     scheduler = CosineAnnealingWarmRestarts(
         optimizer, 
         T_0=100,           # First restart at epoch 20
