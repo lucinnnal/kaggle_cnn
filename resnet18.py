@@ -20,8 +20,8 @@ from tqdm.auto import tqdm
 import random
 
 # Set experiment name and wandb project
-_exp_name = "food_classification_improved"
-project_name = "food_classification"
+_exp_name = "resnet18_food_classification"
+project_name = "Kaggle"
 
 # Set a random seed for reproducibility
 myseed = 6666
