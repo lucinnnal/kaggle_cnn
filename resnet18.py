@@ -20,8 +20,8 @@ from tqdm.auto import tqdm
 import random
 
 # Set experiment name and wandb project
-_exp_name = "resnet18_food_classification"
-project_name = "Kaggle"
+_exp_name = "food_classification_improved"
+project_name = "food_classification"
 
 # Set a random seed for reproducibility
 myseed = 6666
@@ -46,14 +46,14 @@ train_tfm = transforms.Compose([
     # Convert to tensor
     transforms.ToTensor(),
     # Normalize the image
-    transforms.Normalize(mean=[0.5555, 0.4514, 0.3443], std=[0.2701, 0.2729, 0.2792]),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 # Test/validation transformations
 test_tfm = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
-    transforms.Normalize(mean=[0.5555, 0.4514, 0.3443], std=[0.2701, 0.2729, 0.2792]),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
 ])
 
 class FoodDataset(Dataset):
@@ -241,7 +241,7 @@ def main():
     # Hyperparameters
     batch_size = 64
     n_epochs = 100
-    patience = 15
+    patience = 30
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
     # Dataset directory
@@ -327,7 +327,7 @@ def main():
     
     # Second phase: Train on full dataset with fewer epochs
     print("\nPhase 2: Training on full dataset...")
-    n_epochs_phase2 = 50  # Reduced epochs for phase 2
+    n_epochs_phase2 = 100  # Reduced epochs for phase 2
     
     # Combine datasets and create new dataloader
     full_dataset = ConcatDataset([train_set, valid_set])
